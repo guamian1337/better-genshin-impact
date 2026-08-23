@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Diagnostics;
 using Fischless.GameCapture.Graphics.Helpers;
 using SharpDX.Direct3D11;
@@ -70,7 +70,7 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
     // 视图契约与 BitBltMat 同款：存活到「下下一次同环捕获」开始；跨两帧持有会读到覆写数据。
     private readonly Texture2D?[] _roiStagingTextures = new Texture2D?[StagingCount];
     private int _roiIndex;
-    private Texture2D? _rawMappedTexture;   // 全局唯一处于 Mapped 状态的槽（跨环登记）
+    private readonly HashSet<Texture2D> _mappedTextures = new();   // 所有处于 Mapped 状态的槽（跨环、支持多视图并存）
 
     // Surface 大小
     private int _surfaceWidth;
@@ -331,25 +331,35 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
         }
     }
 
-    /// <summary>目标槽即将被写入：若登记簿指向它则立即 Unmap</summary>
+    /// <summary>目标纹理即将被写入/销毁：若处于 Mapped 状态则立即 Unmap 并移出登记簿</summary>
     private void BeginSlotWriteLocked(Texture2D? tex)
     {
-        if (ReferenceEquals(_rawMappedTexture, tex)) UnmapTrackedLocked();
-    }
-
-    private void UnmapTrackedLocked()
-    {
-        var t = _rawMappedTexture;
-        _rawMappedTexture = null;
-        if (t == null) return;
+        if (tex == null || !_mappedTextures.Remove(tex)) return;
         try
         {
-            t.Device.ImmediateContext.UnmapSubresource(t, 0);
+            tex.Device.ImmediateContext.UnmapSubresource(tex, 0);
         }
         catch
         {
-            // 迟到释放容错：纹理可能已被尺寸重建/Stop 销毁
+            // 迟到释放容错
         }
+    }
+
+    /// <summary>Unmap 所有仍处于 Mapped 状态的槽并清空登记簿（Stop/尺寸重建用）</summary>
+    private void UnmapAllMappedLocked()
+    {
+        foreach (var tex in _mappedTextures)
+        {
+            try
+            {
+                tex.Device.ImmediateContext.UnmapSubresource(tex, 0);
+            }
+            catch
+            {
+                // 迟到释放容错：纹理可能已被销毁
+            }
+        }
+        _mappedTextures.Clear();
     }
 
     private static void HandleSharpDxError(SharpDXException e)
@@ -401,7 +411,7 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                             _stagingTextures[i] = null;
                         }
                         _stagingIndex = 0;
-                        UnmapTrackedLocked();
+            UnmapAllMappedLocked();
                         for (var i = 0; i < StagingCount; i++)
                         {
                             _roiStagingTextures[i]?.Dispose();
@@ -489,6 +499,8 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
 
                 var stagingCur = _stagingTextures[curIdx]!;
                 var context = d3dDevice.ImmediateContext;
+                // 该槽若被某次 CaptureRawRegion 的视图占用，先 Unmap 再写入
+                BeginSlotWriteLocked(stagingCur);
                 // Stage 写 cur（GPU -> staging cur）
                 var qpcSubmit0 = Stopwatch.GetTimestamp();
                 context.CopyResource(_gpuTexture, stagingCur);
@@ -585,7 +597,7 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
 
                 var box = context.MapSubresource(roiTex, 0,
                     SharpDX.Direct3D11.MapMode.Read, SharpDX.Direct3D11.MapFlags.None);
-                _rawMappedTexture = roiTex;
+            _mappedTextures.Add(roiTex);
                 _roiIndex ^= 1;
 
                 GameCaptureFrame? frame = null;
@@ -597,7 +609,7 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 catch
                 {
                     // 构造失败立即释放映射，不占坑
-                    UnmapTrackedLocked();
+            UnmapAllMappedLocked();
                     throw;
                 }
 
@@ -804,7 +816,7 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 _stagingTextures[i] = null;
             }
             _stagingIndex = 0;
-            UnmapTrackedLocked();
+            UnmapAllMappedLocked();
             for (var i = 0; i < StagingCount; i++)
             {
                 _roiStagingTextures[i]?.Dispose();
