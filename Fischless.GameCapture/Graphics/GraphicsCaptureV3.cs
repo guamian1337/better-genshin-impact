@@ -64,7 +64,6 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
     // Stage 与 Map 均针对本次的 cur（不读旧帧）
     private const int StagingCount = 2;
     private readonly Texture2D?[] _stagingTextures = new Texture2D?[2];
-    private readonly bool[] _stagingValid = new bool[2];
     private int _stagingIndex;
 
     // Surface 大小
@@ -318,7 +317,6 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
         {
             tex?.Dispose();
             _stagingTextures[index] = Direct3D11Helper.CreateStagingTexture(device, width, height, null);
-            _stagingValid[index] = false;
         }
     }
 
@@ -369,7 +367,6 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
                         {
                             _stagingTextures[i]?.Dispose();
                             _stagingTextures[i] = null;
-                            _stagingValid[i] = false;
                         }
                         _stagingIndex = 0;
                         _frameReady = false;
@@ -457,7 +454,6 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
                 var context = d3dDevice.ImmediateContext;
                 // Stage 写 cur（GPU -> staging cur）
                 context.CopyResource(_gpuTexture, stagingCur);
-                _stagingValid[curIdx] = true;
 
                 // 直接 Map cur：等待本次 Copy 完成（阻塞极短）。
                 // 不再读 prev 流水缓冲——那会让识别内容固定滞后 1 个 Tick(~50ms)，体感延迟明显
@@ -520,6 +516,8 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
                 }
                 else
                 {
+                    // 防御分支：队内 Mat 不应同时存在于借出集合（账本错乱才可达），
+                    // 计入专用计数以免污染 MissEmpty 语义
                     _poolAcquireMissEmpty++;
                     var fresh = new Mat(height, width, MatType.CV_8UC3);
                     _bgrBorrowed.Add(fresh);
@@ -674,7 +672,6 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
             {
                 _stagingTextures[i]?.Dispose();
                 _stagingTextures[i] = null;
-                _stagingValid[i] = false;
             }
             _stagingIndex = 0;
             while (_bgrQueue.TryDequeue(out var pooled)) pooled.Dispose();
