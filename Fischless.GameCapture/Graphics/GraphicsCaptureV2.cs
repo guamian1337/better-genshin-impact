@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using Fischless.GameCapture.Graphics.Helpers;
 using SharpDX.Direct3D11;
 using Vanara.PInvoke;
@@ -11,6 +12,8 @@ using OpenCvSharp;
 using SharpDX;
 using SharpDX.D3DCompiler;
 using SharpDX.DXGI;
+using D3DBuffer = SharpDX.Direct3D11.Buffer;
+using D3DDevice = SharpDX.Direct3D11.Device;
 
 namespace Fischless.GameCapture.Graphics;
 
@@ -103,6 +106,29 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
     private double _submitMax5s;
     private double _readbackSum5s;
     private double _readbackMax5s;
+
+    // GPU 打包 BGR：compute shader 剥 Alpha 写紧凑 BGR24 字节流，CPU 免 CvtColor；
+    // 初始化失败自动回退 CPU 转换路径
+    private bool _gpuPackFailed;
+    private bool _gpuPackReady;
+    private ComputeShader? _packComputeShader;
+    private D3DBuffer? _packParamsCb;
+    private D3DBuffer? _packOutBuffer;
+    private UnorderedAccessView? _packOutUav;
+    private readonly D3DBuffer?[] _stagingBuffers = new D3DBuffer?[StagingCount];
+    private int _packWidth = -1;
+    private int _packHeight = -1;
+    private long _packPaddedBytes;
+    private ShaderResourceView? _gpuTextureSrv;
+    private ShaderResourceView? _hdrOutputSrv;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PackParamsCb
+    {
+        public uint Width;
+        public uint Height;
+        public uint TotalPixels;
+    }
 
     private long _captureCall5s;
 
@@ -246,6 +272,23 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
         return (region, new RECT(left, top, right, bottom));
     }
 
+    private Texture2D CreateBgraTypelessTexture(D3DDevice device, int width, int height)
+    {
+        return new Texture2D(device, new Texture2DDescription
+        {
+            Width = width,
+            Height = height,
+            MipLevels = 1,
+            ArraySize = 1,
+            Format = Format.B8G8R8A8_Typeless,
+            SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Default,
+            CpuAccessFlags = CpuAccessFlags.None,
+            BindFlags = BindFlags.RenderTarget | BindFlags.UnorderedAccess | BindFlags.ShaderResource,
+            OptionFlags = ResourceOptionFlags.None,
+        });
+    }
+
     private Texture2D ProcessHdrTexture(Texture2D hdrTexture)
     {
         var device = hdrTexture.Device;
@@ -254,8 +297,20 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
         var width = hdrTexture.Description.Width;
         var height = hdrTexture.Description.Height;
 
-        _hdrOutputTexture ??= Direct3D11Helper.CreateOutputTexture(device, width, height);
-        _hdrOutputUav ??= new UnorderedAccessView(device, _hdrOutputTexture);
+        // V2 本地类型无关输出纹理：UAV 用 unorm float4 写，打包 SRV 用 R32UInt 读原始字节
+        _hdrOutputTexture ??= CreateBgraTypelessTexture(device, width, height);
+        _hdrOutputUav ??= new UnorderedAccessView(device, _hdrOutputTexture, new UnorderedAccessViewDescription
+        {
+            Format = Format.B8G8R8A8_UNorm,
+            Dimension = UnorderedAccessViewDimension.Texture2D,
+            Texture2D = new UnorderedAccessViewDescription.Texture2DResource { MipSlice = 0 },
+        });
+        _hdrOutputSrv ??= new ShaderResourceView(device, _hdrOutputTexture, new ShaderResourceViewDescription
+        {
+            Format = Format.R32_UInt,
+            Dimension = SharpDX.Direct3D.ShaderResourceViewDimension.Texture2D,
+            Texture2D = new ShaderResourceViewDescription.Texture2DResource { MostDetailedMip = 0, MipLevels = 1 },
+        });
         _hdrComputeShader ??= new ComputeShader(device, ShaderBytecode.Compile(HdrToSdrShader.Content, "CS_HDRtoSDR", "cs_5_0"));
 
         using var inputSrv = new ShaderResourceView(device, hdrTexture);
@@ -287,19 +342,37 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
             _gpuTexture.Description.Height != h)
         {
             _gpuTexture?.Dispose();
+            _gpuTextureSrv?.Dispose();
+            _gpuTextureSrv = null;
+            // Typeless：打包 CS 需要 R32UInt 视图读原始字节；CopyResource 与 UNORM 表面同族兼容
             _gpuTexture = new Texture2D(device, new Texture2DDescription
             {
                 Width = w,
                 Height = h,
                 MipLevels = 1,
                 ArraySize = 1,
-                Format = Format.B8G8R8A8_UNorm,
+                Format = Format.B8G8R8A8_Typeless,
                 SampleDescription = new SampleDescription(1, 0),
                 Usage = ResourceUsage.Default,
                 CpuAccessFlags = CpuAccessFlags.None,
-                BindFlags = BindFlags.None,
+                BindFlags = BindFlags.ShaderResource,
                 OptionFlags = ResourceOptionFlags.None,
             });
+            try
+            {
+                _gpuTextureSrv = new ShaderResourceView(device, _gpuTexture, new ShaderResourceViewDescription
+                {
+                    Format = Format.R32_UInt,
+                    Dimension = SharpDX.Direct3D.ShaderResourceViewDimension.Texture2D,
+                    Texture2D = new ShaderResourceViewDescription.Texture2DResource { MostDetailedMip = 0, MipLevels = 1 },
+                });
+            }
+            catch
+            {
+                _gpuTextureSrv?.Dispose();
+                _gpuTextureSrv = null;
+                throw;
+            }
         }
     }
 
@@ -311,6 +384,99 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
             tex?.Dispose();
             _stagingTextures[index] = Direct3D11Helper.CreateStagingTexture(device, width, height, null);
         }
+    }
+
+    /// <summary>
+    ///     确保 GPU 打包 BGR 资源就绪（着色器/参数缓冲/UAV/双 staging 缓冲）。失败置永久回退标志。
+    /// </summary>
+    private bool EnsurePackResourcesLocked(D3DDevice device, int width, int height)
+    {
+        if (_gpuPackFailed) return false;
+        if (_gpuPackReady && _packWidth == width && _packHeight == height && _gpuTextureSrv != null) return true;
+
+        try
+        {
+            if (!_gpuPackReady)
+            {
+                _packComputeShader ??= new ComputeShader(device,
+                    ShaderBytecode.Compile(PackBgraToBgrShader.Content, "CS_PackBgraToBgr", "cs_5_0"));
+                _packParamsCb ??= new D3DBuffer(device, new BufferDescription
+                {
+                    SizeInBytes = 16,
+                    Usage = ResourceUsage.Default,
+                    BindFlags = BindFlags.ConstantBuffer,
+                    CpuAccessFlags = CpuAccessFlags.None,
+                    OptionFlags = ResourceOptionFlags.None,
+                });
+                _gpuPackReady = true;
+            }
+
+            var totalBytes = (long)width * height * 3;
+            var padded = (totalBytes + 11) / 12 * 12;
+
+            _packOutBuffer?.Dispose();
+            _packOutUav?.Dispose();
+            for (var i = 0; i < StagingCount; i++)
+            {
+                _stagingBuffers[i]?.Dispose();
+                _stagingBuffers[i] = null;
+            }
+
+            _packOutBuffer = new D3DBuffer(device, (int)padded, ResourceUsage.Default, BindFlags.UnorderedAccess,
+                CpuAccessFlags.None, ResourceOptionFlags.BufferAllowRawViews, 0);
+            _packOutUav = new UnorderedAccessView(device, _packOutBuffer, new UnorderedAccessViewDescription
+            {
+                Format = Format.R32_Typeless,
+                Dimension = UnorderedAccessViewDimension.Buffer,
+                Buffer = new UnorderedAccessViewDescription.BufferResource
+                {
+                    FirstElement = 0,
+                    ElementCount = (int)(padded / 4),
+                    Flags = UnorderedAccessViewBufferFlags.Raw,
+                },
+            });
+            for (var i = 0; i < StagingCount; i++)
+            {
+                _stagingBuffers[i] = new D3DBuffer(device, (int)padded, ResourceUsage.Staging, BindFlags.None,
+                    CpuAccessFlags.Read, ResourceOptionFlags.None, 0);
+            }
+
+            var p = new PackParamsCb { Width = (uint)width, Height = (uint)height, TotalPixels = (uint)((long)width * height) };
+            device.ImmediateContext.UpdateSubresource(ref p, _packParamsCb);
+
+            _packWidth = width;
+            _packHeight = height;
+            _packPaddedBytes = padded;
+            return true;
+        }
+        catch (Exception e)
+        {
+            Debug.WriteLine($"[WGC V2] GPU 打包 BGR 初始化失败，回退 CPU CvtColor: {e.Message}");
+            DisposePackResourcesLocked();
+            _gpuPackFailed = true;
+            return false;
+        }
+    }
+
+    private void DisposePackResourcesLocked()
+    {
+        _packOutUav?.Dispose();
+        _packOutUav = null;
+        _packOutBuffer?.Dispose();
+        _packOutBuffer = null;
+        for (var i = 0; i < StagingCount; i++)
+        {
+            _stagingBuffers[i]?.Dispose();
+            _stagingBuffers[i] = null;
+        }
+        _packParamsCb?.Dispose();
+        _packParamsCb = null;
+        _packComputeShader?.Dispose();
+        _packComputeShader = null;
+        _packWidth = -1;
+        _packHeight = -1;
+        _packPaddedBytes = 0;
+        _gpuPackReady = false;
     }
 
     private static void HandleSharpDxError(SharpDXException e)
@@ -363,6 +529,9 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                         }
                         _stagingIndex = 0;
                         _frameReady = false;
+                        DisposePackResourcesLocked();
+                        _gpuTextureSrv?.Dispose();
+                        _gpuTextureSrv = null;
                         _hdrOutputTexture?.Dispose();
                         _hdrOutputTexture = null;
                         _hdrOutputUav?.Dispose();
@@ -416,7 +585,7 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
         }
     }
 
-    public GameCaptureFrame? Capture()
+    public unsafe GameCaptureFrame? Capture()
     {
         if (!_frameReady) return null;
 
@@ -439,19 +608,71 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
 
                 var curIdx = _stagingIndex;
 
-                EnsureStagingTextureLocked(d3dDevice, curIdx, stagingWidth, stagingHeight);
+                double submitMs;
+                double readbackMs;
+                Mat? mat;
 
-                var stagingCur = _stagingTextures[curIdx]!;
                 var context = d3dDevice.ImmediateContext;
-                // Stage 写 cur（GPU -> staging cur）
-                var qpcSubmit0 = Stopwatch.GetTimestamp();
-                context.CopyResource(_gpuTexture, stagingCur);
-                var qpcSubmit1 = Stopwatch.GetTimestamp();
+                var useGpuPack = !_gpuPackFailed && EnsurePackResourcesLocked(d3dDevice, stagingWidth, stagingHeight);
 
-                // 直接 Map cur：等待本次 Copy 完成（阻塞极短）。
-                // 不再读 prev 流水缓冲——那会让识别内容固定滞后 1 个 Tick(~50ms)，体感延迟明显
-                var mat = stagingCur.CreateMat(d3dDevice, AcquireBgrMat, ReleaseBgrMat);
-                var qpcReadback1 = Stopwatch.GetTimestamp();
+                if (useGpuPack)
+                {
+                    // —— GPU 打包路径：CS 剥 Alpha 写紧凑 BGR 字节流 → 拷到 staging 缓冲 → Map 后零转换拷入池化 Mat
+                    EnsureStagingTextureLocked(d3dDevice, curIdx, stagingWidth, stagingHeight);
+                    var packStaging = _stagingBuffers[curIdx]!;
+                    var qpcSubmit0 = Stopwatch.GetTimestamp();
+
+                    context.ComputeShader.Set(_packComputeShader);
+                    context.ComputeShader.SetShaderResource(0, _gpuTextureSrv);
+                    context.ComputeShader.SetUnorderedAccessView(0, _packOutUav);
+                    var threads = ((long)stagingWidth * stagingHeight + PackBgraToBgrShader.PixelsPerThread - 1) / PackBgraToBgrShader.PixelsPerThread;
+                    var groups = (int)Math.Ceiling(threads / (double)PackBgraToBgrShader.ThreadsPerGroup);
+                    context.Dispatch(groups, 1, 1);
+                    context.ComputeShader.SetUnorderedAccessView(0, null);
+                    context.ComputeShader.SetShaderResource(0, null);
+                    context.ComputeShader.Set(null);
+                    context.CopyResource(_packOutBuffer, packStaging);
+                    var qpcSubmit1 = Stopwatch.GetTimestamp();
+
+                    // 阻塞 Map 紧凑字节流（比纹理少 25% 搬运量），直接 memcpy 进池化 Mat
+                    var target = AcquireBgrMat(stagingHeight, stagingWidth);
+                    try
+                    {
+                        var box = context.MapSubresource(packStaging, 0, SharpDX.Direct3D11.MapMode.Read, SharpDX.Direct3D11.MapFlags.None);
+                        try
+                        {
+                            var dataBytes = (long)stagingWidth * stagingHeight * 3;
+                            System.Buffer.MemoryCopy(box.DataPointer.ToPointer(), target.DataPointer, dataBytes, dataBytes);
+                        }
+                        finally
+                        {
+                            context.UnmapSubresource(packStaging, 0);
+                        }
+                        mat = WgcBgrMat.CreateFrom(target, ReleaseBgrMat);
+                    }
+                    catch
+                    {
+                        ReleaseBgrMat(target);
+                        throw;
+                    }
+                    readbackMs = (Stopwatch.GetTimestamp() - qpcSubmit1) * 1000.0 / Stopwatch.Frequency;
+                    submitMs = (qpcSubmit1 - qpcSubmit0) * 1000.0 / Stopwatch.Frequency;
+                }
+                else
+                {
+                    // —— CPU 回退路径：纹理 staging + CvtColor
+                    EnsureStagingTextureLocked(d3dDevice, curIdx, stagingWidth, stagingHeight);
+
+                    var stagingCur = _stagingTextures[curIdx]!;
+                    // Stage 写 cur（GPU -> staging cur）
+                    context.CopyResource(_gpuTexture, stagingCur);
+
+                    // 直接 Map cur：等待本次 Copy 完成（阻塞极短）。
+                    // 不再读 prev 流水缓冲——那会让识别内容固定滞后 1 个 Tick(~50ms)，体感延迟明显
+                    mat = stagingCur.CreateMat(d3dDevice, AcquireBgrMat, ReleaseBgrMat);
+                    submitMs = 0;
+                    readbackMs = 0;
+                }
 
                 // 翻转 cur/prev 供下一帧流水
                 _stagingIndex ^= 1;
@@ -464,8 +685,6 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 _mapGapSum5s += mapGapMs;
 
                 // 消费分段耗时入账
-                var submitMs = (qpcSubmit1 - qpcSubmit0) * 1000.0 / Stopwatch.Frequency;
-                var readbackMs = (qpcReadback1 - qpcSubmit1) * 1000.0 / Stopwatch.Frequency;
                 _submitSum5s += submitMs;
                 if (submitMs > _submitMax5s) _submitMax5s = submitMs;
                 _readbackSum5s += readbackMs;
@@ -671,6 +890,9 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
             _stagingIndex = 0;
             while (_bgrQueue.TryDequeue(out var pooled)) pooled.Dispose();
             _bgrPoolClosed = true;
+            DisposePackResourcesLocked();
+            _gpuTextureSrv?.Dispose();
+            _gpuTextureSrv = null;
             _hdrOutputTexture?.Dispose();
             _hdrOutputTexture = null;
             _hdrOutputUav?.Dispose();
