@@ -66,12 +66,6 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
     private readonly Texture2D?[] _stagingTextures = new Texture2D?[2];
     private int _stagingIndex;
 
-    // 零拷贝直通（CaptureRaw）：当前处于 Mapped 状态的 staging 槽登记。
-    // 视图契约：返回的 Mat 包装映射指针，存活到「下下一次捕获」开始；
-    // 任何路径写入/重建/销毁该槽前必须先 Unmap（BeginSlotWriteLocked / UnmapTrackedLocked）
-    private int _rawMappedSlot = -1;
-    private Texture2D? _rawMappedTexture;
-
     // Surface 大小
     private int _surfaceWidth;
     private int _surfaceHeight;
@@ -315,37 +309,9 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
         var tex = _stagingTextures[index];
         if (tex == null || tex.Description.Width != width || tex.Description.Height != height)
         {
-            // 该槽若处于 Mapped 状态（旧视图仍被外部持有），重建前强制释放映射
-            if (_rawMappedSlot == index) UnmapTrackedLocked();
             tex?.Dispose();
             _stagingTextures[index] = Direct3D11Helper.CreateStagingTexture(device, width, height, null);
         }
-    }
-
-    /// <summary>目标槽即将被写入/销毁：若处于 Mapped 状态则立即 Unmap</summary>
-    private void BeginSlotWriteLocked(int index)
-    {
-        if (_rawMappedSlot == index) UnmapTrackedLocked();
-    }
-
-    private void UnmapTrackedLocked()
-    {
-        if (_rawMappedSlot < 0 || _rawMappedTexture == null)
-        {
-            _rawMappedSlot = -1;
-            _rawMappedTexture = null;
-            return;
-        }
-        try
-        {
-            _rawMappedTexture.Device.ImmediateContext.UnmapSubresource(_rawMappedTexture, 0);
-        }
-        catch
-        {
-            // 迟到释放容错：纹理可能已被尺寸重建/Stop 销毁，此时无需也无法 Unmap
-        }
-        _rawMappedSlot = -1;
-        _rawMappedTexture = null;
     }
 
     private static void HandleSharpDxError(SharpDXException e)
@@ -398,7 +364,6 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                         }
                         _stagingIndex = 0;
                         _frameReady = false;
-                        UnmapTrackedLocked();
                         _hdrOutputTexture?.Dispose();
                         _hdrOutputTexture = null;
                         _hdrOutputUav?.Dispose();
@@ -479,8 +444,6 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
 
                 var stagingCur = _stagingTextures[curIdx]!;
                 var context = d3dDevice.ImmediateContext;
-                // 该槽若被上一次 CaptureRaw 的视图占用，先 Unmap 再写入
-                BeginSlotWriteLocked(curIdx);
                 // Stage 写 cur（GPU -> staging cur）
                 var qpcSubmit0 = Stopwatch.GetTimestamp();
                 context.CopyResource(_gpuTexture, stagingCur);
@@ -490,12 +453,6 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 // 不再读 prev 流水缓冲——那会让识别内容固定滞后 1 个 Tick(~50ms)，体感延迟明显
                 var mat = stagingCur.CreateMat(d3dDevice, AcquireBgrMat, ReleaseBgrMat);
                 var qpcReadback1 = Stopwatch.GetTimestamp();
-                // CreateMat 内部已完成 Map+Unmap：若登记簿指向本槽则同步清除
-                if (_rawMappedSlot == curIdx)
-                {
-                    _rawMappedSlot = -1;
-                    _rawMappedTexture = null;
-                }
 
                 // 翻转 cur/prev 供下一帧流水
                 _stagingIndex ^= 1;
@@ -532,61 +489,6 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 HandleSharpDxError(e);
                 return null;
             }
-        }
-    }
-
-    /// <summary>
-    ///     零拷贝 BGRA 直通视图：跳过池化/转换/memcpy，返回映射指针包装的 CV_8UC4 Mat。
-    ///     <para><b>生命周期契约（与 BitBltMat 同款）：</b>
-    ///     数据存活到「下下一次 Capture/CaptureRaw」开始，届时该 staging 被覆写。
-    ///     跨两帧持有将读到脏数据或直接崩溃；需要长期持有的消费方请自行 .Clone()。</para>
-    ///     <para>通道为 4 通道带 Alpha（B,G,R,A 内存序，前三通道值与 BGR 完全一致）；
-    ///     仅限「读完即弃」的延迟敏感路径使用（如罗盘角度读取），勿接入存量 3ch 识别链。</para>
-    /// </summary>
-    public GameCaptureFrame? CaptureRaw()
-    {
-        if (!_frameReady) return null;
-
-        lock (_lock)
-        {
-            if (!IsCapturing || _gpuTexture == null) return null;
-
-            var d3dDevice = _gpuTexture.Device;
-            var desc = _gpuTexture.Description;
-            var rect = _captureRect;
-            var curIdx = _stagingIndex;
-
-            EnsureStagingTextureLocked(d3dDevice, curIdx, desc.Width, desc.Height);
-            BeginSlotWriteLocked(curIdx);
-
-            var context = d3dDevice.ImmediateContext;
-            var qpcSubmit0 = Stopwatch.GetTimestamp();
-            context.CopyResource(_gpuTexture, _stagingTextures[curIdx]!);
-            var box = context.MapSubresource(_stagingTextures[curIdx]!, 0,
-                SharpDX.Direct3D11.MapMode.Read, SharpDX.Direct3D11.MapFlags.None);
-            var qpcSubmit1 = Stopwatch.GetTimestamp();
-
-            // 登记映射：本视图存活至下下次捕获（另一槽先被写入一轮）
-            _rawMappedSlot = curIdx;
-            _rawMappedTexture = _stagingTextures[curIdx];
-            _stagingIndex ^= 1;
-
-            var nowMap = _frameTimer.ElapsedMilliseconds;
-            _mapCount5s++;
-
-            // 内容年龄与 Capture() 同口径
-            if (_composeBootMs >= 0)
-            {
-                var qpcNowMs = Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency;
-                var age = Math.Max(0, qpcNowMs - _composeBootMs);
-                _ageSum5s += age;
-                if (age > _ageMax5s) _ageMax5s = age;
-            }
-            TickDiagLocked(nowMap);
-
-            // 零转换：BGRA 视图直接交付
-            var view = Mat.FromPixelData(desc.Height, desc.Width, MatType.CV_8UC4, box.DataPointer, box.RowPitch);
-            return new GameCaptureFrame(view, rect);
         }
     }
 
@@ -768,7 +670,6 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 _stagingTextures[i] = null;
             }
             _stagingIndex = 0;
-            UnmapTrackedLocked();
             while (_bgrQueue.TryDequeue(out var pooled)) pooled.Dispose();
             _bgrPoolClosed = true;
             _hdrOutputTexture?.Dispose();
