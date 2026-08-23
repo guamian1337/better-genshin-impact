@@ -18,9 +18,8 @@ public class CameraRotateTask(CancellationToken ct)
     /// </summary>
     /// <param name="targetOrientation"></param>
     /// <param name="imageRegion"></param>
-    /// <param name="gainScale">增益缩放（过冲阻尼用，默认 1）</param>
     /// <returns></returns>
-    public float RotateToApproach(float targetOrientation, ImageRegion imageRegion, double gainScale = 1.0)
+    public float RotateToApproach(float targetOrientation, ImageRegion imageRegion)
     {
         var cao = CameraOrientation.Compute(imageRegion.SrcMat);
         var diff = (cao - targetOrientation + 180) % 360 - 180;
@@ -46,12 +45,7 @@ public class CameraRotateTask(CancellationToken ct)
             controlRatio = 2;
         }
 
-        controlRatio *= gainScale;
-        var dx = (int)Math.Round(-controlRatio * diff * _dpi);
-        // 单次指令上限，防止积压输入一次性兑现时甩过头
-        if (dx > 900) dx = 900;
-        else if (dx < -900) dx = -900;
-        Simulation.SendInput.Mouse.MoveMouseBy(dx, 0);
+        Simulation.SendInput.Mouse.MoveMouseBy((int)Math.Round(-controlRatio * diff * _dpi), 0);
         return diff;
     }
 
@@ -66,75 +60,14 @@ public class CameraRotateTask(CancellationToken ct)
     {
         bool isSuccessful = false;
         int count = 0;
-        var v3 = TaskTriggerDispatcher.GlobalGameCapture as Fischless.GameCapture.Graphics.GraphicsCaptureV3;
-
-        float prevCao = float.NaN;   // 上一轮罗盘读数（冻结检测用）
-        bool hasSentDelta = false;   // 是否已发出未兑现的旋转指令
-        float prevDiff = float.NaN;  // 过冲检测用
-        double gainScale = 1.0;
-        int frozenSkips = 0;
-
         while (!ct.IsCancellationRequested)
         {
             using var screen = CaptureToRectArea();
-            var cao = CameraOrientation.Compute(screen.SrcMat);
-
-            // 冻结防护：已发旋转指令但罗盘读数与上一轮完全一致，
-            // 说明该指令还在 输入IPC→游戏处理→渲染→送帧 的管线里没兑现（分身可达 200ms+）。
-            // 此时继续叠加全量 delta，管线追上时会一次性兑现 → 冲过目标来回打转。
-            // 正确做法：不再发指令，等反馈更新。
-            if (hasSentDelta && cao == prevCao)
-            {
-                frozenSkips++;
-                await Delay(30, ct);
-                count++;
-                if (count > maxTryTimes)
-                {
-                    Logger.LogWarning("视角转动到目标角度超时（等待输入兑现），停止转动");
-                    break;
-                }
-                continue;
-            }
-
-            var diff = RotateToApproach(targetOrientation, screen, gainScale);
-            prevCao = cao;
-            hasSentDelta = Math.Abs(diff) >= maxDiff;
-
-            if (frozenSkips > 0 && (count < 8 || count % 10 == 0))
-            {
-                Logger.LogInformation("[转向调试] 冻结等待 x{Skips} 后恢复", frozenSkips);
-                frozenSkips = 0;
-            }
-
-            // 转向调试：帧龄=截图内容距今多久；gen 是否前进；gain=过冲阻尼系数
-            if (count < 8 || count % 10 == 0)
-            {
-                Logger.LogInformation(
-                    "[转向调试] n={Count} diff={Diff:F1} 帧龄={Age}ms gen={Gen} gain={Gain:F2} 目标={Target}",
-                    count, diff, v3?.FrameAgeMs ?? -1, v3?.FrameGen ?? -1, gainScale, targetOrientation);
-            }
-
-            if (Math.Abs(diff) < maxDiff)
+            if (Math.Abs(RotateToApproach(targetOrientation, screen)) < maxDiff)
             {
                 isSuccessful = true;
                 break;
             }
-
-            // 过冲阻尼：符号翻转（冲过目标）说明积压输入仍在兑现，
-            // 降低后续增益并多等一拍，避免反向全量修正再次穿越
-            if (!float.IsNaN(prevDiff) && prevDiff * diff < 0 && Math.Abs(prevDiff) > maxDiff)
-            {
-                gainScale = Math.Max(0.35, gainScale * 0.6);
-                await Delay(60, ct);
-                count += 2;
-            }
-            else if (Math.Abs(diff) < 30)
-            {
-                // 回到小偏差区间后恢复增益
-                gainScale = 1.0;
-            }
-
-            prevDiff = diff;
 
             if (count > maxTryTimes)
             {
