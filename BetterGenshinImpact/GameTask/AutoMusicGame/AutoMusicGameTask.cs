@@ -73,7 +73,8 @@ public class AutoMusicGameTask(AutoMusicGameParam taskParam) : ISoloTask
                     keys.Add((keyValuePair.Key, x, y));
                 }
 
-                taskList.Add(Task.Run(() => DoWhitePressPipeline(ct, keys), ct));
+                var v2 = TaskTriggerDispatcher.GlobalGameCapture as Fischless.GameCapture.Graphics.GraphicsCaptureV2;
+                taskList.Add(Task.Run(() => DoWhitePressPipeline(ct, keys, v2), ct));
             }
             else
             {
@@ -125,42 +126,85 @@ public class AutoMusicGameTask(AutoMusicGameParam taskParam) : ISoloTask
 
     /// <summary>
     ///     截图管线模式：单采集循环驱动全部键位。
-    ///     一个线程按固定节奏 CaptureToRectArea 一次，内联检查所有键位的 B 通道并维护
-    ///     各键的按下状态机（最短按压 minHoldMs）——相比每键独立轮询（6 线程 × 5ms），
-    ///     Capture/CvtColor 次数压缩到帧率上限，同时消除高频唤醒带来的调度开销
-    ///     （NtDelayExecution / SwapContext，实测占进程内核时间 ~12%）。
+    ///     一个线程按固定节奏采集一次，内联检查所有键位的 B 通道并维护
+    ///     各键的按下状态机（最短按压 minHoldMs）。
+    ///     <para>V2 捕获下走 ROI 点采样快路径：只把键位横条搬进小 staging，
+    ///     免全屏读回与 CvtColor（4K 下收益最大）；其他捕获模式回退
+    ///     CaptureToRectArea 全屏路径，行为与旧版一致。</para>
     /// </summary>
-    private async Task DoWhitePressPipeline(CancellationToken ct, IReadOnlyList<(User32.VK Key, int X, int Y)> keys)
+    private async Task DoWhitePressPipeline(CancellationToken ct,
+        IReadOnlyList<(User32.VK Key, int X, int Y)> keys,
+        Fischless.GameCapture.Graphics.GraphicsCaptureV2? v2)
     {
         const int minHoldMs = 80;
+        const int marginX = 64;
+        const int marginY = 48;
         var states = new bool[keys.Count];
         var pressTicks = new long[keys.Count];
+
+        void SampleKey(int i, (User32.VK Key, int X, int Y) key, Mat mat, int ox, int oy)
+        {
+            var px = key.X - ox;
+            var py = key.Y - oy;
+            if ((uint)px >= (uint)mat.Width || (uint)py >= (uint)mat.Height) return;
+
+            var b = mat.At<Vec3b>(py, px).Item0;   // BGRA/BGR 内存序首字节均为 B
+            if (states[i])
+            {
+                if (b >= 220 && Environment.TickCount64 - pressTicks[i] >= minHoldMs)
+                {
+                    states[i] = false;
+                    KeyUp(key.Key);
+                }
+            }
+            else if (b < 220)
+            {
+                states[i] = true;
+                pressTicks[i] = Environment.TickCount64;
+                KeyDown(key.Key);
+            }
+        }
+
+        // ROI 包围盒：由键位推导，越界部分由 V2 内部收敛
+        var minX = int.MaxValue;
+        var minY = int.MaxValue;
+        var maxX = int.MinValue;
+        var maxY = int.MinValue;
+        foreach (var k in keys)
+        {
+            if (k.X < minX) minX = k.X;
+            if (k.X > maxX) maxX = k.X;
+            if (k.Y < minY) minY = k.Y;
+            if (k.Y > maxY) maxY = k.Y;
+        }
+
+        var roiX = Math.Max(0, minX - marginX);
+        var roiY = Math.Max(0, minY - marginY);
+        var roiW = (maxX + marginX) - roiX;
+        var roiH = (maxY + marginY) - roiY;
 
         while (!ct.IsCancellationRequested)
         {
             await Task.Delay(5, ct);
-            using var cap = CaptureToRectArea();
-            var mat = cap.SrcMat;
-            for (var i = 0; i < keys.Count; i++)
-            {
-                var (key, px, py) = keys[i];
-                if (px >= mat.Width || py >= mat.Height) continue;
 
-                var b = mat.At<Vec3b>(py, px).Item0;
-                if (states[i])
+            if (v2 != null)
+            {
+                using var cap = v2.CaptureRawRegion(roiX, roiY, roiW, roiH);
+                if (cap == null || cap.Frame == null || cap.Frame.Empty()) continue;
+
+                for (var i = 0; i < keys.Count; i++)
                 {
-                    // 已按下：B 通道回白且满足最短按压时长才松开
-                    if (b >= 220 && Environment.TickCount64 - pressTicks[i] >= minHoldMs)
-                    {
-                        states[i] = false;
-                        KeyUp(key);
-                    }
+                    SampleKey(i, keys[i], cap.Frame, roiX, roiY);
                 }
-                else if (b < 220)
+            }
+            else
+            {
+                using var cap = CaptureToRectArea();
+                if (cap == null || cap.SrcMat == null || cap.SrcMat.Empty()) continue;
+
+                for (var i = 0; i < keys.Count; i++)
                 {
-                    states[i] = true;
-                    pressTicks[i] = Environment.TickCount64;
-                    KeyDown(key);
+                    SampleKey(i, keys[i], cap.SrcMat, 0, 0);
                 }
             }
         }
