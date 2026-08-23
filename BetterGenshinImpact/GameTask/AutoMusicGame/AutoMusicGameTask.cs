@@ -80,11 +80,15 @@ public class AutoMusicGameTask(AutoMusicGameParam taskParam) : ISoloTask
 
     private async Task DoWhitePressWin32(CancellationToken ct, User32.VK key, Point point)
     {
+        if (TaskContext.Instance().Config.AutoMusicGameConfig.UseCapturePipeline)
+        {
+            await DoWhitePressCapture(ct, key, point);
+            return;
+        }
+
         while (!ct.IsCancellationRequested)
         {
             await Task.Delay(5, ct);
-            // Stopwatch sw = new();
-            // sw.Start();
             var hdc = User32.GetDC(_hWnd);
             var c = Gdi32.GetPixel(hdc, point.X, point.Y);
             Gdi32.DeleteDC(hdc);
@@ -106,9 +110,38 @@ public class AutoMusicGameTask(AutoMusicGameParam taskParam) : ISoloTask
 
                 KeyUp(key);
             }
+        }
+    }
 
-            // sw.Stop();
-            // Debug.WriteLine($"GetPixel 耗时：{sw.ElapsedMilliseconds} （{point.X},{point.Y}）颜色{c.R},{c.G},{c.B}");
+    /// <summary>
+    ///     走全局截图管线的音符检测（支持 WGC V2 / BitBlt 等全部捕获模式，含后台/分身场景）。
+    ///     白键判定：B 通道 &lt; 220 视为按下；为避免过快松开，最短按压 80ms。
+    /// </summary>
+    private async Task DoWhitePressCapture(CancellationToken ct, User32.VK key, Point point)
+    {
+        const int minHoldMs = 80;
+        while (!ct.IsCancellationRequested)
+        {
+            await Task.Delay(5, ct);
+            using var cap = CaptureToRectArea();
+            if (point.X >= cap.SrcMat.Width || point.Y >= cap.SrcMat.Height) continue;
+            var pixel = cap.SrcMat.At<Vec3b>(point.Y, point.X);
+            if (pixel.Item0 < 220)
+            {
+                KeyDown(key);
+                var holdStart = Environment.TickCount;
+                while (!ct.IsCancellationRequested)
+                {
+                    await Task.Delay(5, ct);
+                    using var cap2 = CaptureToRectArea();
+                    if (point.X >= cap2.SrcMat.Width || point.Y >= cap2.SrcMat.Height) continue;
+                    var pixel2 = cap2.SrcMat.At<Vec3b>(point.Y, point.X);
+                    var elapsed = Environment.TickCount - holdStart;
+                    if (pixel2.Item0 >= 220 && elapsed >= minHoldMs)
+                        break;
+                }
+                KeyUp(key);
+            }
         }
     }
 

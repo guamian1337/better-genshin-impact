@@ -18,4 +18,10 @@ public partial class AutoMusicGameConfig : ObservableObject
     // 乐曲级别
     [ObservableProperty] 
     private string _musicLevel = "";
+
+    /// <summary>
+    /// 使用截图器检测音符（替代 GDI GetPixel；支持 WGC V2 等全部捕获模式）
+    /// </summary>
+    [ObservableProperty]
+    private bool _useCapturePipeline = false;
 }
