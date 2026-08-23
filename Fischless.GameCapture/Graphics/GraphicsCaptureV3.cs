@@ -90,12 +90,8 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
     private long _mapGapSum5s;
     private int _copySum5s;
 
-    // 帧代次 + 同帧去重缓存（SharedFrameCache）
-    // 默认关闭：BitBlt 式语义——每次 Capture 都真实读回最新帧。
-    // 去重可省重复读回的 CPU，但会给控制回路（如视角旋转）引入"旧帧复用"时序风险；
-    // 需要时可通过 settings["WgcSharedReadback"]=true 显式开启
+    // 帧代次：回调每收到一帧自增，供 FrameGen 诊断
     private long _copyGen;
-    private bool _sharedReadbackEnabled = false;
 
     // 诊断：最近一次 WGC 帧到达时刻（_frameTimer 时基），用于测量帧年龄
     private long _lastCopyTickMs = -1;
@@ -116,17 +112,7 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
     public long FrameAgeMs => IsCapturing ? _frameTimer.ElapsedMilliseconds - _lastCopyTickMs : -1;
     /// <summary>当前帧代次</summary>
     public long FrameGen => _copyGen;
-    private SharedFrameCache? _sharedCache;
-    private long _sharedDedupHit5s;
-    private long _sharedReadback5s;
     private long _captureCall5s;
-
-    private sealed class SharedFrameCache
-    {
-        public Mat Owner = null!;
-        public long Gen;
-        public int Refs;
-    }
 
     private readonly Stopwatch _frameTimer = new();
 
@@ -151,12 +137,6 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
         try
         {
             _hWnd = hWnd;
-
-            if (settings != null)
-            {
-                if (settings.TryGetValue("WgcSharedReadback", out var shared) && shared is bool sb)
-                    _sharedReadbackEnabled = sb;
-            }
 
             (_region, _captureRect) = GetGameScreenInfo(hWnd);
 
@@ -393,7 +373,6 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
                         }
                         _stagingIndex = 0;
                         _frameReady = false;
-                        InvalidateSharedCacheLocked();
                         _hdrOutputTexture?.Dispose();
                         _hdrOutputTexture = null;
                         _hdrOutputUav?.Dispose();
@@ -457,22 +436,12 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
         {
             if (_gpuTexture == null) return null;
 
-            // Map 读本次 cur staging，内容与 gen 一致；同 gen 内重复 Capture 命中缓存返回同一份内容
-            var gen = _copyGen;
+            // Map 读本次 cur staging，内容与 gen 一致
             _captureCall5s++;
             var nowMap = _frameTimer.ElapsedMilliseconds;
 
             try
             {
-                var cache = _sharedCache;
-                if (_sharedReadbackEnabled && cache != null && cache.Gen == gen && !cache.Owner.IsDisposed)
-                {
-                    cache.Refs++;
-                    _sharedDedupHit5s++;
-                    TickDiagLocked(nowMap);
-                    return new GameCaptureFrame(WgcBgrMat.CreateFrom(cache.Owner, m => ReleaseShared(m, cache)), _captureRect);
-                }
-
                 var d3dDevice = _gpuTexture.Device;
                 var desc = _gpuTexture.Description;
                 var rect = _captureRect;
@@ -492,22 +461,7 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
 
                 // 直接 Map cur：等待本次 Copy 完成（阻塞极短）。
                 // 不再读 prev 流水缓冲——那会让识别内容固定滞后 1 个 Tick(~50ms)，体感延迟明显
-                Texture2D? stagingToMap = stagingCur;
-
-                SharedFrameCache? newCache = null;
-                Mat? sharedOwner = null;
-                var mat = _sharedReadbackEnabled
-                    ? stagingToMap!.CreateMat(d3dDevice, out sharedOwner, AcquireBgrMat,
-                        m => { if (newCache != null) ReleaseShared(m, newCache); else ReleaseBgrMat(m); })
-                    : stagingToMap!.CreateMat(d3dDevice, out _, AcquireBgrMat, ReleaseBgrMat);
-
-                if (_sharedReadbackEnabled && mat != null && sharedOwner != null)
-                {
-                    RetireSharedCacheLocked();
-                    newCache = new SharedFrameCache { Owner = sharedOwner, Gen = gen, Refs = 1 };
-                    _sharedCache = newCache;
-                    _sharedReadback5s++;
-                }
+                var mat = stagingCur.CreateMat(d3dDevice, AcquireBgrMat, ReleaseBgrMat);
 
                 // 翻转 cur/prev 供下一帧流水
                 _stagingIndex ^= 1;
@@ -624,51 +578,6 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
         }
     }
 
-    private void ReleaseShared(Mat owner, SharedFrameCache cache)
-    {
-        lock (_lock)
-        {
-            cache.Refs--;
-            if (cache.Refs < 0)
-            {
-                // 防御：正常路径不应出现负值，出现说明归还计数异常
-                Debug.WriteLine($"[WGC Shared] refs 计数异常(负值) gen={cache.Gen}");
-            }
-            if (cache.Refs <= 0 && _sharedCache != cache)
-            {
-                if (owner.IsDisposed)
-                {
-                    Debug.WriteLine("[WGC Shared] 归还时 owner 已被释放，跳过（防二次归还）");
-                    return;
-                }
-                ReleaseBgrMat(owner);
-            }
-        }
-    }
-
-    private void RetireSharedCacheLocked()
-    {
-        var old = _sharedCache;
-        _sharedCache = null;
-        if (old == null) return;
-        if (old.Refs <= 0)
-        {
-            ReleaseBgrMat(old.Owner);
-        }
-    }
-
-    private void InvalidateSharedCacheLocked()
-    {
-        var c = _sharedCache;
-        _sharedCache = null;
-        if (c == null) return;
-        if (c.Refs <= 0)
-        {
-            _bgrBorrowed.Remove(c.Owner);
-            c.Owner.Dispose();
-        }
-    }
-
     private void TickDiagLocked(long now)
     {
         if (_lastDiagTime == 0)
@@ -680,14 +589,11 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
         if (now - _lastDiagTime < 5000) return;
         Debug.WriteLine($"[WGC Diag] 5s: Map次数={_mapCount5s} 平均间隔={_mapGapSum5s / Math.Max(1, _mapCount5s):F0}ms 平均攒获Copy={_copySum5s / Math.Max(1, _mapCount5s):F1} 总提交={_copySum5s + _mapCount5s}");
         Debug.WriteLine($"[WGC Pipe] 5s: 回调滞后 avg={(_cbCount5s > 0 ? _cbLagSum5s / _cbCount5s : -1):F1}ms max={_cbLagMax5s:F1} | 内容年龄 avg={(_mapCount5s > 0 ? _ageSum5s / Math.Max(1, _mapCount5s) : -1):F1}ms max={_ageMax5s:F1}");
-        Debug.WriteLine($"[WGC Shared] 5s: Capture调用={_captureCall5s} 命中={_sharedDedupHit5s} 读回={_sharedReadback5s} 缓存refs={_sharedCache?.Refs ?? -1}");
         Debug.WriteLine($"[WGC Pool] 5s: Hit={_poolAcquireHit} Miss(空={_poolAcquireMissEmpty} 废={_poolAcquireMissDisposed} 尺寸={_poolAcquireMissSize}) Release(Pushed={_poolReleasePushed} 废={_poolReleaseDropDisposed} 关={_poolReleaseDropClosed} 满={_poolReleaseDropFull}) 池存={_bgrQueue.Count} 在途={_poolAcquireTotal - _poolReleaseTotal}(借{_poolAcquireTotal}还{_poolReleaseTotal})");
         _mapCount5s = 0;
         _mapGapSum5s = 0;
         _copySum5s = 0;
         _captureCall5s = 0;
-        _sharedDedupHit5s = 0;
-        _sharedReadback5s = 0;
         _cbLagSum5s = 0;
         _cbLagMax5s = 0;
         _cbCount5s = 0;
@@ -773,7 +679,6 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
             _stagingIndex = 0;
             while (_bgrQueue.TryDequeue(out var pooled)) pooled.Dispose();
             _bgrPoolClosed = true;
-            InvalidateSharedCacheLocked();
             _hdrOutputTexture?.Dispose();
             _hdrOutputTexture = null;
             _hdrOutputUav?.Dispose();
