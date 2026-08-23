@@ -14,7 +14,7 @@ using SharpDX.DXGI;
 
 namespace Fischless.GameCapture.Graphics;
 
-public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
+public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
 {
     // BGR Mat 池：有界 ConcurrentQueue，FIFO 回收
     private const int MaxPoolSize = 16;
@@ -406,7 +406,7 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
         }
         catch (Exception e)
         {
-            Debug.WriteLine($"[WGC V3] FrameArrived 异常: {e.Message}");
+            Debug.WriteLine($"[WGC V2] FrameArrived 异常: {e.Message}");
         }
     }
 

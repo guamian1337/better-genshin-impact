@@ -20,7 +20,7 @@ public enum CaptureModes
     [DefaultValue(3)]
     WindowsGraphicsCaptureHdr = 3,
 
-    [Description("WindowsGraphicsCapture（V3 单纹理+流水）")]
+    [Description("WindowsGraphicsCapture（V2 单纹理广播+池化）")]
     [DefaultValue(5)]
-    WindowsGraphicsCaptureV3 = 5,
+    WindowsGraphicsCaptureV2 = 5,
 }
