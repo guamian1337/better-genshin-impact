@@ -98,6 +98,12 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
     private double _ageSum5s;
     private double _ageMax5s;
 
+    // 消费分段耗时：提交(GPU->staging 命令) 与 读回+转换(阻塞 Map + CvtColor)
+    private double _submitSum5s;
+    private double _submitMax5s;
+    private double _readbackSum5s;
+    private double _readbackMax5s;
+
     private long _captureCall5s;
 
     private readonly Stopwatch _frameTimer = new();
@@ -438,11 +444,14 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 var stagingCur = _stagingTextures[curIdx]!;
                 var context = d3dDevice.ImmediateContext;
                 // Stage 写 cur（GPU -> staging cur）
+                var qpcSubmit0 = Stopwatch.GetTimestamp();
                 context.CopyResource(_gpuTexture, stagingCur);
+                var qpcSubmit1 = Stopwatch.GetTimestamp();
 
                 // 直接 Map cur：等待本次 Copy 完成（阻塞极短）。
                 // 不再读 prev 流水缓冲——那会让识别内容固定滞后 1 个 Tick(~50ms)，体感延迟明显
                 var mat = stagingCur.CreateMat(d3dDevice, AcquireBgrMat, ReleaseBgrMat);
+                var qpcReadback1 = Stopwatch.GetTimestamp();
 
                 // 翻转 cur/prev 供下一帧流水
                 _stagingIndex ^= 1;
@@ -453,6 +462,14 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 _copyCountSinceLastMap = 0;
                 _mapCount5s++;
                 _mapGapSum5s += mapGapMs;
+
+                // 消费分段耗时入账
+                var submitMs = (qpcSubmit1 - qpcSubmit0) * 1000.0 / Stopwatch.Frequency;
+                var readbackMs = (qpcReadback1 - qpcSubmit1) * 1000.0 / Stopwatch.Frequency;
+                _submitSum5s += submitMs;
+                if (submitMs > _submitMax5s) _submitMax5s = submitMs;
+                _readbackSum5s += readbackMs;
+                if (readbackMs > _readbackMax5s) _readbackMax5s = readbackMs;
 
                 // 内容年龄：消费时刻 - 该帧 DWM 合成时刻（含投递+轮询相位的端到端新鲜度）
                 if (_composeBootMs >= 0)
@@ -571,7 +588,7 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
         }
         if (now - _lastDiagTime < 5000) return;
         Debug.WriteLine($"[WGC Diag] 5s: Map次数={_mapCount5s} 平均间隔={_mapGapSum5s / Math.Max(1, _mapCount5s):F0}ms 平均攒获Copy={_copySum5s / Math.Max(1, _mapCount5s):F1} 总提交={_copySum5s + _mapCount5s}");
-        Debug.WriteLine($"[WGC Pipe] 5s: 回调滞后 avg={(_cbCount5s > 0 ? _cbLagSum5s / _cbCount5s : -1):F1}ms max={_cbLagMax5s:F1} | 内容年龄 avg={(_mapCount5s > 0 ? _ageSum5s / Math.Max(1, _mapCount5s) : -1):F1}ms max={_ageMax5s:F1}");
+        Debug.WriteLine($"[WGC Pipe] 5s: 回调滞后 avg={(_cbCount5s > 0 ? _cbLagSum5s / _cbCount5s : -1):F1}ms max={_cbLagMax5s:F1} | 内容年龄 avg={(_mapCount5s > 0 ? _ageSum5s / Math.Max(1, _mapCount5s) : -1):F1}ms max={_ageMax5s:F1} | 消费分段 提交 avg={(_mapCount5s > 0 ? _submitSum5s / Math.Max(1, _mapCount5s) : -1):F2}ms max={_submitMax5s:F2} 读回+转换 avg={(_mapCount5s > 0 ? _readbackSum5s / Math.Max(1, _mapCount5s) : -1):F2}ms max={_readbackMax5s:F2}");
         Debug.WriteLine($"[WGC Pool] 5s: Hit={_poolAcquireHit} Miss(空={_poolAcquireMissEmpty} 废={_poolAcquireMissDisposed} 尺寸={_poolAcquireMissSize}) Release(Pushed={_poolReleasePushed} 废={_poolReleaseDropDisposed} 关={_poolReleaseDropClosed} 满={_poolReleaseDropFull}) 池存={_bgrQueue.Count} 在途={_poolAcquireTotal - _poolReleaseTotal}(借{_poolAcquireTotal}还{_poolReleaseTotal})");
         _mapCount5s = 0;
         _mapGapSum5s = 0;
@@ -582,6 +599,10 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
         _cbCount5s = 0;
         _ageSum5s = 0;
         _ageMax5s = 0;
+        _submitSum5s = 0;
+        _submitMax5s = 0;
+        _readbackSum5s = 0;
+        _readbackMax5s = 0;
         _lastDiagTime = now;
         _windowAcquireCount = 0;
     }
