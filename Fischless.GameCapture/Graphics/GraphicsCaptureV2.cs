@@ -120,7 +120,6 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
     private int _packHeight = -1;
     private long _packPaddedBytes;
     private ShaderResourceView? _gpuTextureSrv;
-    private ShaderResourceView? _hdrOutputSrv;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct PackParamsCb
@@ -272,23 +271,6 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
         return (region, new RECT(left, top, right, bottom));
     }
 
-    private Texture2D CreateBgraTypelessTexture(D3DDevice device, int width, int height)
-    {
-        return new Texture2D(device, new Texture2DDescription
-        {
-            Width = width,
-            Height = height,
-            MipLevels = 1,
-            ArraySize = 1,
-            Format = Format.B8G8R8A8_Typeless,
-            SampleDescription = new SampleDescription(1, 0),
-            Usage = ResourceUsage.Default,
-            CpuAccessFlags = CpuAccessFlags.None,
-            BindFlags = BindFlags.RenderTarget | BindFlags.UnorderedAccess | BindFlags.ShaderResource,
-            OptionFlags = ResourceOptionFlags.None,
-        });
-    }
-
     private Texture2D ProcessHdrTexture(Texture2D hdrTexture)
     {
         var device = hdrTexture.Device;
@@ -297,20 +279,9 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
         var width = hdrTexture.Description.Width;
         var height = hdrTexture.Description.Height;
 
-        // V2 本地类型无关输出纹理：UAV 用 unorm float4 写，打包 SRV 用 R32UInt 读原始字节
-        _hdrOutputTexture ??= CreateBgraTypelessTexture(device, width, height);
-        _hdrOutputUav ??= new UnorderedAccessView(device, _hdrOutputTexture, new UnorderedAccessViewDescription
-        {
-            Format = Format.B8G8R8A8_UNorm,
-            Dimension = UnorderedAccessViewDimension.Texture2D,
-            Texture2D = new UnorderedAccessViewDescription.Texture2DResource { MipSlice = 0 },
-        });
-        _hdrOutputSrv ??= new ShaderResourceView(device, _hdrOutputTexture, new ShaderResourceViewDescription
-        {
-            Format = Format.R32_UInt,
-            Dimension = SharpDX.Direct3D.ShaderResourceViewDimension.Texture2D,
-            Texture2D = new ShaderResourceViewDescription.Texture2DResource { MostDetailedMip = 0, MipLevels = 1 },
-        });
+        // V2 消费侧需要从输出纹理读原始字节打包：UNORM 资源 + 同格式显式视图（浮点往返精确还原字节）
+        _hdrOutputTexture ??= Direct3D11Helper.CreateOutputTexture(device, width, height);
+        _hdrOutputUav ??= new UnorderedAccessView(device, _hdrOutputTexture);
         _hdrComputeShader ??= new ComputeShader(device, ShaderBytecode.Compile(HdrToSdrShader.Content, "CS_HDRtoSDR", "cs_5_0"));
 
         using var inputSrv = new ShaderResourceView(device, hdrTexture);
@@ -344,14 +315,14 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
             _gpuTexture?.Dispose();
             _gpuTextureSrv?.Dispose();
             _gpuTextureSrv = null;
-            // Typeless：打包 CS 需要 R32UInt 视图读原始字节；CopyResource 与 UNORM 表面同族兼容
+            // UNORM 资源 + 同格式 SRV（浮点视图）；BGRA 家族无 UINT 格式，整数视图不可用
             _gpuTexture = new Texture2D(device, new Texture2DDescription
             {
                 Width = w,
                 Height = h,
                 MipLevels = 1,
                 ArraySize = 1,
-                Format = Format.B8G8R8A8_Typeless,
+                Format = Format.B8G8R8A8_UNorm,
                 SampleDescription = new SampleDescription(1, 0),
                 Usage = ResourceUsage.Default,
                 CpuAccessFlags = CpuAccessFlags.None,
@@ -362,7 +333,7 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
             {
                 _gpuTextureSrv = new ShaderResourceView(device, _gpuTexture, new ShaderResourceViewDescription
                 {
-                    Format = Format.R32_UInt,
+                    Format = Format.B8G8R8A8_UNorm,
                     Dimension = SharpDX.Direct3D.ShaderResourceViewDimension.Texture2D,
                     Texture2D = new ShaderResourceViewDescription.Texture2DResource { MostDetailedMip = 0, MipLevels = 1 },
                 });
@@ -613,7 +584,8 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 Mat? mat;
 
                 var context = d3dDevice.ImmediateContext;
-                var useGpuPack = !_gpuPackFailed && EnsurePackResourcesLocked(d3dDevice, stagingWidth, stagingHeight);
+                var useGpuPack = !_gpuPackFailed && _gpuTextureSrv != null &&
+                                 EnsurePackResourcesLocked(d3dDevice, stagingWidth, stagingHeight);
 
                 if (useGpuPack)
                 {

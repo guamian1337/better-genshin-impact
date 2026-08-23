@@ -2,7 +2,8 @@ namespace Fischless.GameCapture.Graphics.Helpers;
 
 /// <summary>
 ///     将 BGRA 纹理打包为紧凑 BGR24 字节流的计算着色器（丢 Alpha，无通道重排）。
-///     每线程处理 4 个线性像素：读 4 个 R32_UINT（内存序 B,G,R,A），剥 Alpha 打包成 3 个 uint 写出。
+///     通过 B8G8R8A8_UNORM 浮点视图读取（该家族无 UINT 格式），x*255+0.5 取整可无损还原字节；
+///     每线程处理 4 个线性像素，剥 Alpha 打包成 3 个 uint 写出。
 /// </summary>
 public static class PackBgraToBgrShader
 {
@@ -18,8 +19,18 @@ cbuffer Params : register(b0)
     uint TotalPixels;
 };
 
-Texture2D<uint4> bgraTex : register(t0);
+Texture2D<float4> bgraTex : register(t0);
 RWByteAddressBuffer PackedBgr : register(u0);
+
+uint ToBgr24(uint2 id)
+{
+    // UNORM SRV 逻辑序为 RGBA；目标内存序为 B,G,R；*255+0.5 取整无损还原字节
+    float4 c = bgraTex.Load(int3(id, 0));
+    uint r = (uint)(c.x * 255.0f + 0.5f);
+    uint g = (uint)(c.y * 255.0f + 0.5f);
+    uint b = (uint)(c.z * 255.0f + 0.5f);
+    return b | (g << 8) | (r << 16);
+}
 
 [numthreads(64, 1, 1)]
 void CS_PackBgraToBgr(uint3 dt : SV_DispatchThreadID)
@@ -27,12 +38,14 @@ void CS_PackBgraToBgr(uint3 dt : SV_DispatchThreadID)
     uint p0 = dt.x * 4u;
     if (p0 >= TotalPixels) return;
 
-    uint i0 = 0, i1 = 0, i2 = 0, i3 = 0;
+    uint x = p0 % Width;
+    uint y = p0 / Width;
+    uint i0 = ToBgr24(uint2(x, y));
 
-    i0 = bgraTex.Load(int3((int)(p0 % Width), (int)(p0 / Width), 0)).x;
-    if (p0 + 1u < TotalPixels) i1 = bgraTex.Load(int3((int)((p0 + 1u) % Width), (int)((p0 + 1u) / Width), 0)).x;
-    if (p0 + 2u < TotalPixels) i2 = bgraTex.Load(int3((int)((p0 + 2u) % Width), (int)((p0 + 2u) / Width), 0)).x;
-    if (p0 + 3u < TotalPixels) i3 = bgraTex.Load(int3((int)((p0 + 3u) % Width), (int)((p0 + 3u) / Width), 0)).x;
+    uint i1 = 0, i2 = 0, i3 = 0;
+    if (p0 + 1u < TotalPixels) { uint xx = (p0 + 1u) % Width; uint yy = (p0 + 1u) / Width; i1 = ToBgr24(uint2(xx, yy)); }
+    if (p0 + 2u < TotalPixels) { uint xx = (p0 + 2u) % Width; uint yy = (p0 + 2u) / Width; i2 = ToBgr24(uint2(xx, yy)); }
+    if (p0 + 3u < TotalPixels) { uint xx = (p0 + 3u) % Width; uint yy = (p0 + 3u) / Width; i3 = ToBgr24(uint2(xx, yy)); }
 
     uint addr = p0 * 3u;
     PackedBgr.Store(addr,
