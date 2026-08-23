@@ -99,6 +99,19 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
 
     // 诊断：最近一次 WGC 帧到达时刻（_frameTimer 时基），用于测量帧年龄
     private long _lastCopyTickMs = -1;
+
+    // 投递链路诊断：SystemRelativeTime 为 DWM 合成时刻（QPC 时基，与 GetTimestamp 同源），
+    // 用于拆解 合成→回调→消费 各段归属（30fps 下 WGC 与 BitBlt 差距定位用）
+    private double _composeBootMs = -1;   // 最新帧合成时刻（开机毫秒）
+    private double _cbLagLastMs = -1;     // 最近一帧 合成→回调 滞后
+    private double _cbLagSum5s;
+    private double _cbLagMax5s;
+    private int _cbCount5s;
+    private double _ageSum5s;
+    private double _ageMax5s;
+
+    /// <summary>最近一帧 合成→回调 的投递滞后（毫秒）；未运行返回 -1</summary>
+    public double CallbackLagMs => IsCapturing ? _cbLagLastMs : -1;
     /// <summary>当前帧年龄：距最近一次 WGC 帧送达的毫秒数；未运行返回 -1</summary>
     public long FrameAgeMs => IsCapturing ? _frameTimer.ElapsedMilliseconds - _lastCopyTickMs : -1;
     /// <summary>当前帧代次</summary>
@@ -416,6 +429,13 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
                 _copyCountSinceLastMap++;
                 _copyGen++;
                 _lastCopyTickMs = _frameTimer.ElapsedMilliseconds;
+                var qpcNowMs = Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency;
+                var composeMs = frame.SystemRelativeTime.TotalMilliseconds;
+                _composeBootMs = composeMs;
+                _cbLagLastMs = Math.Max(0, qpcNowMs - composeMs);
+                _cbLagSum5s += _cbLagLastMs;
+                if (_cbLagLastMs > _cbLagMax5s) _cbLagMax5s = _cbLagLastMs;
+                _cbCount5s++;
                 _frameReady = true;
             }
         }
@@ -498,6 +518,15 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
                 _copyCountSinceLastMap = 0;
                 _mapCount5s++;
                 _mapGapSum5s += mapGapMs;
+
+                // 内容年龄：消费时刻 - 该帧 DWM 合成时刻（含投递+轮询相位的端到端新鲜度）
+                if (_composeBootMs >= 0)
+                {
+                    var qpcNowMs = Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency;
+                    var age = Math.Max(0, qpcNowMs - _composeBootMs);
+                    _ageSum5s += age;
+                    if (age > _ageMax5s) _ageMax5s = age;
+                }
                 TickDiagLocked(nowMap);
 
                 return mat == null ? null : new GameCaptureFrame(mat, rect);
@@ -650,6 +679,7 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
         }
         if (now - _lastDiagTime < 5000) return;
         Debug.WriteLine($"[WGC Diag] 5s: Map次数={_mapCount5s} 平均间隔={_mapGapSum5s / Math.Max(1, _mapCount5s):F0}ms 平均攒获Copy={_copySum5s / Math.Max(1, _mapCount5s):F1} 总提交={_copySum5s + _mapCount5s}");
+        Debug.WriteLine($"[WGC Pipe] 5s: 回调滞后 avg={(_cbCount5s > 0 ? _cbLagSum5s / _cbCount5s : -1):F1}ms max={_cbLagMax5s:F1} | 内容年龄 avg={(_mapCount5s > 0 ? _ageSum5s / Math.Max(1, _mapCount5s) : -1):F1}ms max={_ageMax5s:F1}");
         Debug.WriteLine($"[WGC Shared] 5s: Capture调用={_captureCall5s} 命中={_sharedDedupHit5s} 读回={_sharedReadback5s} 缓存refs={_sharedCache?.Refs ?? -1}");
         Debug.WriteLine($"[WGC Pool] 5s: Hit={_poolAcquireHit} Miss(空={_poolAcquireMissEmpty} 废={_poolAcquireMissDisposed} 尺寸={_poolAcquireMissSize}) Release(Pushed={_poolReleasePushed} 废={_poolReleaseDropDisposed} 关={_poolReleaseDropClosed} 满={_poolReleaseDropFull}) 池存={_bgrQueue.Count} 在途={_poolAcquireTotal - _poolReleaseTotal}(借{_poolAcquireTotal}还{_poolReleaseTotal})");
         _mapCount5s = 0;
@@ -658,8 +688,24 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
         _captureCall5s = 0;
         _sharedDedupHit5s = 0;
         _sharedReadback5s = 0;
+        _cbLagSum5s = 0;
+        _cbLagMax5s = 0;
+        _cbCount5s = 0;
+        _ageSum5s = 0;
+        _ageMax5s = 0;
         _lastDiagTime = now;
         _windowAcquireCount = 0;
+    }
+
+    /// <summary>投递链路统计快照（供探针等外部打印；读取近一个 5s 窗口的累计值）</summary>
+    public string GetPipeStatsSnapshot()
+    {
+        lock (_lock)
+        {
+            var cbAvg = _cbCount5s > 0 ? _cbLagSum5s / _cbCount5s : -1;
+            var ageAvg = _mapCount5s > 0 ? _ageSum5s / Math.Max(1, _mapCount5s) : -1;
+            return $"回调滞后 avg={cbAvg:F1}ms max={_cbLagMax5s:F1}({_cbCount5s}帧) | 内容年龄 avg={ageAvg:F1}ms max={_ageMax5s:F1}({_mapCount5s}次)";
+        }
     }
 
     private void TrimBgrPoolForSizeLocked(int height, int width)

@@ -42,6 +42,12 @@ public static class CameraLatencyProbe
             await Delay(700, ct);
         }
         Logger.LogInformation("[延迟探针] 结束");
+
+        // 投递链路统计（仅 WGC V3 有数据）：区分 DWM 投递滞后 vs 消费侧读回新鲜度
+        if (TaskTriggerDispatcher.GlobalGameCapture is Fischless.GameCapture.Graphics.GraphicsCaptureV3 v3)
+        {
+            Logger.LogInformation("[延迟探针] 投递统计: {Stats}", v3.GetPipeStatsSnapshot());
+        }
     }
 
     private static async Task ProbeOnce(int dx, int n, CancellationToken ct)
