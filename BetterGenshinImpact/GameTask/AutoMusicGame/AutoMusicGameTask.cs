@@ -62,11 +62,27 @@ public class AutoMusicGameTask(AutoMusicGameParam taskParam) : ISoloTask
             // 计算按键位置
             using var gameCaptureRegion = CaptureToRectArea();
 
-            foreach (var keyValuePair in _keyX)
+            if (TaskContext.Instance().Config.AutoMusicGameConfig.UseCapturePipeline)
             {
-                var (x, y) = gameCaptureRegion.ConvertPositionToGameCaptureRegion((int)(keyValuePair.Value * assetScale), (int)(_keyY * assetScale));
-                // 添加任务
-                taskList.Add(Task.Run(async () => await DoWhitePressWin32(ct, keyValuePair.Key, new Point(x, y)), ct));
+                // 截图管线模式：单采集循环驱动全部键位（替代每键独立轮询，
+                // 把 Capture/CvtColor 频率压到帧率上限，同时消除高频唤醒的调度开销）
+                var keys = new List<(User32.VK Key, int X, int Y)>();
+                foreach (var keyValuePair in _keyX)
+                {
+                    var (x, y) = gameCaptureRegion.ConvertPositionToGameCaptureRegion((int)(keyValuePair.Value * assetScale), (int)(_keyY * assetScale));
+                    keys.Add((keyValuePair.Key, x, y));
+                }
+
+                taskList.Add(Task.Run(() => DoWhitePressPipeline(ct, keys), ct));
+            }
+            else
+            {
+                foreach (var keyValuePair in _keyX)
+                {
+                    var (x, y) = gameCaptureRegion.ConvertPositionToGameCaptureRegion((int)(keyValuePair.Value * assetScale), (int)(_keyY * assetScale));
+                    // 添加任务
+                    taskList.Add(Task.Run(async () => await DoWhitePressWin32(ct, keyValuePair.Key, new Point(x, y)), ct));
+                }
             }
 
             await Task.WhenAll(taskList);
@@ -80,12 +96,6 @@ public class AutoMusicGameTask(AutoMusicGameParam taskParam) : ISoloTask
 
     private async Task DoWhitePressWin32(CancellationToken ct, User32.VK key, Point point)
     {
-        if (TaskContext.Instance().Config.AutoMusicGameConfig.UseCapturePipeline)
-        {
-            await DoWhitePressCapture(ct, key, point);
-            return;
-        }
-
         while (!ct.IsCancellationRequested)
         {
             await Task.Delay(5, ct);
@@ -114,33 +124,44 @@ public class AutoMusicGameTask(AutoMusicGameParam taskParam) : ISoloTask
     }
 
     /// <summary>
-    ///     走全局截图管线的音符检测（支持 WGC V2 / BitBlt 等全部捕获模式，含后台/分身场景）。
-    ///     白键判定：B 通道 &lt; 220 视为按下；为避免过快松开，最短按压 80ms。
+    ///     截图管线模式：单采集循环驱动全部键位。
+    ///     一个线程按固定节奏 CaptureToRectArea 一次，内联检查所有键位的 B 通道并维护
+    ///     各键的按下状态机（最短按压 minHoldMs）——相比每键独立轮询（6 线程 × 5ms），
+    ///     Capture/CvtColor 次数压缩到帧率上限，同时消除高频唤醒带来的调度开销
+    ///     （NtDelayExecution / SwapContext，实测占进程内核时间 ~12%）。
     /// </summary>
-    private async Task DoWhitePressCapture(CancellationToken ct, User32.VK key, Point point)
+    private async Task DoWhitePressPipeline(CancellationToken ct, IReadOnlyList<(User32.VK Key, int X, int Y)> keys)
     {
         const int minHoldMs = 80;
+        var states = new bool[keys.Count];
+        var pressTicks = new long[keys.Count];
+
         while (!ct.IsCancellationRequested)
         {
             await Task.Delay(5, ct);
             using var cap = CaptureToRectArea();
-            if (point.X >= cap.SrcMat.Width || point.Y >= cap.SrcMat.Height) continue;
-            var pixel = cap.SrcMat.At<Vec3b>(point.Y, point.X);
-            if (pixel.Item0 < 220)
+            var mat = cap.SrcMat;
+            for (var i = 0; i < keys.Count; i++)
             {
-                KeyDown(key);
-                var holdStart = Environment.TickCount;
-                while (!ct.IsCancellationRequested)
+                var (key, px, py) = keys[i];
+                if (px >= mat.Width || py >= mat.Height) continue;
+
+                var b = mat.At<Vec3b>(py, px).Item0;
+                if (states[i])
                 {
-                    await Task.Delay(5, ct);
-                    using var cap2 = CaptureToRectArea();
-                    if (point.X >= cap2.SrcMat.Width || point.Y >= cap2.SrcMat.Height) continue;
-                    var pixel2 = cap2.SrcMat.At<Vec3b>(point.Y, point.X);
-                    var elapsed = Environment.TickCount - holdStart;
-                    if (pixel2.Item0 >= 220 && elapsed >= minHoldMs)
-                        break;
+                    // 已按下：B 通道回白且满足最短按压时长才松开
+                    if (b >= 220 && Environment.TickCount64 - pressTicks[i] >= minHoldMs)
+                    {
+                        states[i] = false;
+                        KeyUp(key);
+                    }
                 }
-                KeyUp(key);
+                else if (b < 220)
+                {
+                    states[i] = true;
+                    pressTicks[i] = Environment.TickCount64;
+                    KeyDown(key);
+                }
             }
         }
     }
