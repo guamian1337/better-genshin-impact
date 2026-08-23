@@ -89,28 +89,15 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
     private long _mapGapSum5s;
     private int _copySum5s;
 
-    // 帧代次：回调每收到一帧自增，供 FrameGen 诊断
-    private long _copyGen;
-
-    // 诊断：最近一次 WGC 帧到达时刻（_frameTimer 时基），用于测量帧年龄
-    private long _lastCopyTickMs = -1;
-
     // 投递链路诊断：SystemRelativeTime 为 DWM 合成时刻（QPC 时基，与 GetTimestamp 同源），
     // 用于拆解 合成→回调→消费 各段归属（30fps 下 WGC 与 BitBlt 差距定位用）
     private double _composeBootMs = -1;   // 最新帧合成时刻（开机毫秒）
-    private double _cbLagLastMs = -1;     // 最近一帧 合成→回调 滞后
     private double _cbLagSum5s;
     private double _cbLagMax5s;
     private int _cbCount5s;
     private double _ageSum5s;
     private double _ageMax5s;
 
-    /// <summary>最近一帧 合成→回调 的投递滞后（毫秒）；未运行返回 -1</summary>
-    public double CallbackLagMs => IsCapturing ? _cbLagLastMs : -1;
-    /// <summary>当前帧年龄：距最近一次 WGC 帧送达的毫秒数；未运行返回 -1</summary>
-    public long FrameAgeMs => IsCapturing ? _frameTimer.ElapsedMilliseconds - _lastCopyTickMs : -1;
-    /// <summary>当前帧代次</summary>
-    public long FrameGen => _copyGen;
     private long _captureCall5s;
 
     private readonly Stopwatch _frameTimer = new();
@@ -403,14 +390,12 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
                     context.CopyResource(sourceTexture, _gpuTexture);
                 }
                 _copyCountSinceLastMap++;
-                _copyGen++;
-                _lastCopyTickMs = _frameTimer.ElapsedMilliseconds;
                 var qpcNowMs = Stopwatch.GetTimestamp() * 1000.0 / Stopwatch.Frequency;
                 var composeMs = frame.SystemRelativeTime.TotalMilliseconds;
                 _composeBootMs = composeMs;
-                _cbLagLastMs = Math.Max(0, qpcNowMs - composeMs);
-                _cbLagSum5s += _cbLagLastMs;
-                if (_cbLagLastMs > _cbLagMax5s) _cbLagMax5s = _cbLagLastMs;
+                var cbLag = Math.Max(0, qpcNowMs - composeMs);
+                _cbLagSum5s += cbLag;
+                if (cbLag > _cbLagMax5s) _cbLagMax5s = cbLag;
                 _cbCount5s++;
                 _frameReady = true;
             }
@@ -599,17 +584,6 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
         _ageMax5s = 0;
         _lastDiagTime = now;
         _windowAcquireCount = 0;
-    }
-
-    /// <summary>投递链路统计快照（供探针等外部打印；读取近一个 5s 窗口的累计值）</summary>
-    public string GetPipeStatsSnapshot()
-    {
-        lock (_lock)
-        {
-            var cbAvg = _cbCount5s > 0 ? _cbLagSum5s / _cbCount5s : -1;
-            var ageAvg = _mapCount5s > 0 ? _ageSum5s / Math.Max(1, _mapCount5s) : -1;
-            return $"回调滞后 avg={cbAvg:F1}ms max={_cbLagMax5s:F1}({_cbCount5s}帧) | 内容年龄 avg={ageAvg:F1}ms max={_ageMax5s:F1}({_mapCount5s}次)";
-        }
     }
 
     private void TrimBgrPoolForSizeLocked(int height, int width)
