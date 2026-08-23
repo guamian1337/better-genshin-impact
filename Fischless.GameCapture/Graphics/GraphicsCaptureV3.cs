@@ -16,11 +16,8 @@ namespace Fischless.GameCapture.Graphics;
 
 public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
 {
-    // BGR Mat 池：有界 ConcurrentQueue，FIFO + 闲置老化回收
-    // V2 为 48，此版按需求改为 16（与 IdleRetain 对齐，峰值内存减半）
+    // BGR Mat 池：有界 ConcurrentQueue，FIFO 回收
     private const int MaxPoolSize = 16;
-    private const int IdleRetainMax = 16;
-    private const int IdleTrimAcquireThreshold = 8;
     private readonly ConcurrentQueue<Mat> _bgrQueue = new();
     private bool _bgrPoolClosed = true;
     private readonly HashSet<Mat> _bgrBorrowed = new();
@@ -35,7 +32,6 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
     private long _poolReleaseDropFull;
     private long _poolAcquireTotal;
     private long _poolReleaseTotal;
-    private long _poolTrimmed;
     private int _windowAcquireCount;
 
     private nint _hWnd;
@@ -62,10 +58,10 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
     // 单 GPU 广播源（参考 bgi-wgc-single-slot / _gpuFrameTexture 模式）
     // 回调只做 GPU->GPU Copy 到此纹理，消费侧 Capture() 再从它 Copy 到 staging 读回
     private Texture2D? _gpuTexture;
-    private bool _frameReady;
+    private volatile bool _frameReady;
 
-    // staging 双缓冲（参考 obs-studio/libobs/obs-video.c NUM_TEXTURES=2）
-    // 流水：Stage 写 cur，Map 读 prev，下一帧翻转
+    // staging 双缓冲：交替使用两块 staging，避免 GPU 写与 CPU Map 连续命中同一块表面；
+    // Stage 与 Map 均针对本次的 cur（不读旧帧）
     private const int StagingCount = 2;
     private readonly Texture2D?[] _stagingTextures = new Texture2D?[2];
     private readonly bool[] _stagingValid = new bool[2];
@@ -95,8 +91,18 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
     private int _copySum5s;
 
     // 帧代次 + 同帧去重缓存（SharedFrameCache）
+    // 默认关闭：BitBlt 式语义——每次 Capture 都真实读回最新帧。
+    // 去重可省重复读回的 CPU，但会给控制回路（如视角旋转）引入"旧帧复用"时序风险；
+    // 需要时可通过 settings["WgcSharedReadback"]=true 显式开启
     private long _copyGen;
-    private bool _sharedReadbackEnabled = true;
+    private bool _sharedReadbackEnabled = false;
+
+    // 诊断：最近一次 WGC 帧到达时刻（_frameTimer 时基），用于测量帧年龄
+    private long _lastCopyTickMs = -1;
+    /// <summary>当前帧年龄：距最近一次 WGC 帧送达的毫秒数；未运行返回 -1</summary>
+    public long FrameAgeMs => IsCapturing ? _frameTimer.ElapsedMilliseconds - _lastCopyTickMs : -1;
+    /// <summary>当前帧代次</summary>
+    public long FrameGen => _copyGen;
     private SharedFrameCache? _sharedCache;
     private long _sharedDedupHit5s;
     private long _sharedReadback5s;
@@ -118,6 +124,15 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
     }
 
     public void Start(nint hWnd, Dictionary<string, object>? settings = null)
+    {
+        // 全程持锁，防并发双 Start 泄漏 framepool/session/hook（Monitor 可重入，内部 Stop 安全）
+        lock (_lock)
+        {
+            StartCore(hWnd, settings);
+        }
+    }
+
+    private void StartCore(nint hWnd, Dictionary<string, object>? settings = null)
     {
         Stop();
         try
@@ -269,6 +284,11 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
 
         context.Dispatch(threadGroupCountX, threadGroupCountY, 1);
 
+        // 解绑，避免后续 CopyResource 触发 read/write hazard
+        context.ComputeShader.SetUnorderedAccessView(0, null);
+        context.ComputeShader.SetShaderResource(0, null);
+        context.ComputeShader.Set(null);
+
         return _hdrOutputTexture;
     }
 
@@ -320,55 +340,67 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
 
     private void OnFrameArrived(Direct3D11CaptureFramePool sender, object args)
     {
-        if (_hWnd == 0) return;
-        using var frame = sender.TryGetNextFrame();
-        if (frame == null) return;
-
-        var now = _frameTimer.ElapsedMilliseconds;
-
-        if (_sizeDirty || now - _lastSizeFallbackCheckMs >= SizeFallbackCheckMs)
-        {
-            _lastSizeFallbackCheckMs = now;
-            _sizeDirty = false;
-            var captureSize = _captureItem!.Size;
-
-            if (captureSize.Width != _surfaceWidth || captureSize.Height != _surfaceHeight)
-            {
-                if (User32.IsIconic(_hWnd)) return;
-                lock (_lock)
-                {
-                    _captureFramePool!.Recreate(_d3dDevice, _pixelFormat, 2, captureSize);
-                    _surfaceWidth = captureSize.Width;
-                    _surfaceHeight = captureSize.Height;
-                    (_region, _captureRect) = GetGameScreenInfo(_hWnd);
-                    var newW = _region != null ? _region.Value.Right - _region.Value.Left : captureSize.Width;
-                    var newH = _region != null ? _region.Value.Bottom - _region.Value.Top : captureSize.Height;
-                    TrimBgrPoolForSizeLocked(newH, newW);
-                    _gpuTexture?.Dispose();
-                    _gpuTexture = null;
-                    for (var i = 0; i < StagingCount; i++)
-                    {
-                        _stagingTextures[i]?.Dispose();
-                        _stagingTextures[i] = null;
-                        _stagingValid[i] = false;
-                    }
-                    _stagingIndex = 0;
-                    _frameReady = false;
-                    InvalidateSharedCacheLocked();
-                    _hdrOutputTexture?.Dispose();
-                    _hdrOutputTexture = null;
-                    _hdrOutputUav?.Dispose();
-                    _hdrOutputUav = null;
-                }
-                return;
-            }
-        }
-
+        // 兜底：任何异常不得穿透 WinRT 回调线程（否则可能直接崩溃进程）
         try
         {
+            if (_hWnd == 0) return;
+            using var frame = sender.TryGetNextFrame();
+            if (frame == null) return;
+
+            var now = _frameTimer.ElapsedMilliseconds;
+
+            if (_sizeDirty || now - _lastSizeFallbackCheckMs >= SizeFallbackCheckMs)
+            {
+                var regionDirty = _sizeDirty;
+                _lastSizeFallbackCheckMs = now;
+                _sizeDirty = false;
+                lock (_lock)
+                {
+                    // Stop() 迟到回调防护：会话已结束则放弃本帧（防 NRE / 幽灵纹理复活）
+                    if (!IsCapturing || _captureItem == null || _captureFramePool == null || _d3dDevice == null) return;
+
+                    var captureSize = _captureItem.Size;
+                    if (captureSize.Width != _surfaceWidth || captureSize.Height != _surfaceHeight)
+                    {
+                        if (User32.IsIconic(_hWnd)) return;
+                        _captureFramePool.Recreate(_d3dDevice, _pixelFormat, 2, captureSize);
+                        _surfaceWidth = captureSize.Width;
+                        _surfaceHeight = captureSize.Height;
+                        (_region, _captureRect) = GetGameScreenInfo(_hWnd);
+                        var newW = _region != null ? _region.Value.Right - _region.Value.Left : captureSize.Width;
+                        var newH = _region != null ? _region.Value.Bottom - _region.Value.Top : captureSize.Height;
+                        TrimBgrPoolForSizeLocked(newH, newW);
+                        _gpuTexture?.Dispose();
+                        _gpuTexture = null;
+                        for (var i = 0; i < StagingCount; i++)
+                        {
+                            _stagingTextures[i]?.Dispose();
+                            _stagingTextures[i] = null;
+                            _stagingValid[i] = false;
+                        }
+                        _stagingIndex = 0;
+                        _frameReady = false;
+                        InvalidateSharedCacheLocked();
+                        _hdrOutputTexture?.Dispose();
+                        _hdrOutputTexture = null;
+                        _hdrOutputUav?.Dispose();
+                        _hdrOutputUav = null;
+                        return;
+                    }
+
+                    // 纯移动窗口不改尺寸时也需刷新裁剪区，否则 region 错位
+                    if (regionDirty)
+                    {
+                        (_region, _captureRect) = GetGameScreenInfo(_hWnd);
+                    }
+                }
+            }
+
             using var surfaceTexture = Direct3D11Helper.CreateSharpDXTexture2D(frame.Surface);
             lock (_lock)
             {
+                // Stop 迟到回调防护：防 EnsureGpuTexture 复活幽灵纹理
+                if (!IsCapturing) return;
                 var sourceTexture = _isHdrEnabled ? ProcessHdrTexture(surfaceTexture) : surfaceTexture;
                 var d3dDevice = sourceTexture.Device;
                 EnsureGpuTexture(d3dDevice, frame.ContentSize.Width, frame.ContentSize.Height, _region);
@@ -383,12 +415,17 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
                 }
                 _copyCountSinceLastMap++;
                 _copyGen++;
+                _lastCopyTickMs = _frameTimer.ElapsedMilliseconds;
+                _frameReady = true;
             }
-            _frameReady = true;
         }
         catch (SharpDXException e)
         {
             HandleSharpDxError(e);
+        }
+        catch (Exception e)
+        {
+            Debug.WriteLine($"[WGC V3] FrameArrived 异常: {e.Message}");
         }
     }
 
@@ -400,6 +437,7 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
         {
             if (_gpuTexture == null) return null;
 
+            // Map 读本次 cur staging，内容与 gen 一致；同 gen 内重复 Capture 命中缓存返回同一份内容
             var gen = _copyGen;
             _captureCall5s++;
             var nowMap = _frameTimer.ElapsedMilliseconds;
@@ -423,7 +461,6 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
                 var stagingHeight = desc.Height;
 
                 var curIdx = _stagingIndex;
-                var prevIdx = curIdx ^ 1;
 
                 EnsureStagingTextureLocked(d3dDevice, curIdx, stagingWidth, stagingHeight);
 
@@ -433,19 +470,9 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
                 context.CopyResource(_gpuTexture, stagingCur);
                 _stagingValid[curIdx] = true;
 
-                // 选择 Map 源：优先 prev（流水），否则回退 cur（首帧/尺寸变化后）
-                Texture2D? stagingToMap;
-                if (_stagingTextures[prevIdx] != null &&
-                    _stagingValid[prevIdx] &&
-                    _stagingTextures[prevIdx]!.Description.Width == stagingWidth &&
-                    _stagingTextures[prevIdx]!.Description.Height == stagingHeight)
-                {
-                    stagingToMap = _stagingTextures[prevIdx];
-                }
-                else
-                {
-                    stagingToMap = stagingCur;
-                }
+                // 直接 Map cur：等待本次 Copy 完成（阻塞极短）。
+                // 不再读 prev 流水缓冲——那会让识别内容固定滞后 1 个 Tick(~50ms)，体感延迟明显
+                Texture2D? stagingToMap = stagingCur;
 
                 SharedFrameCache? newCache = null;
                 Mat? sharedOwner = null;
@@ -573,8 +600,18 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
         lock (_lock)
         {
             cache.Refs--;
+            if (cache.Refs < 0)
+            {
+                // 防御：正常路径不应出现负值，出现说明归还计数异常
+                Debug.WriteLine($"[WGC Shared] refs 计数异常(负值) gen={cache.Gen}");
+            }
             if (cache.Refs <= 0 && _sharedCache != cache)
             {
+                if (owner.IsDisposed)
+                {
+                    Debug.WriteLine("[WGC Shared] 归还时 owner 已被释放，跳过（防二次归还）");
+                    return;
+                }
                 ReleaseBgrMat(owner);
             }
         }
@@ -614,7 +651,7 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
         if (now - _lastDiagTime < 5000) return;
         Debug.WriteLine($"[WGC Diag] 5s: Map次数={_mapCount5s} 平均间隔={_mapGapSum5s / Math.Max(1, _mapCount5s):F0}ms 平均攒获Copy={_copySum5s / Math.Max(1, _mapCount5s):F1} 总提交={_copySum5s + _mapCount5s}");
         Debug.WriteLine($"[WGC Shared] 5s: Capture调用={_captureCall5s} 命中={_sharedDedupHit5s} 读回={_sharedReadback5s} 缓存refs={_sharedCache?.Refs ?? -1}");
-        Debug.WriteLine($"[WGC Pool] 5s: Hit={_poolAcquireHit} Miss(空={_poolAcquireMissEmpty} 废={_poolAcquireMissDisposed} 尺寸={_poolAcquireMissSize}) Release(Pushed={_poolReleasePushed} 废={_poolReleaseDropDisposed} 关={_poolReleaseDropClosed} 满={_poolReleaseDropFull}) 池存={_bgrQueue.Count} 在途={_poolAcquireTotal - _poolReleaseTotal}(借{_poolAcquireTotal}还{_poolReleaseTotal}) 修剪={_poolTrimmed}");
+        Debug.WriteLine($"[WGC Pool] 5s: Hit={_poolAcquireHit} Miss(空={_poolAcquireMissEmpty} 废={_poolAcquireMissDisposed} 尺寸={_poolAcquireMissSize}) Release(Pushed={_poolReleasePushed} 废={_poolReleaseDropDisposed} 关={_poolReleaseDropClosed} 满={_poolReleaseDropFull}) 池存={_bgrQueue.Count} 在途={_poolAcquireTotal - _poolReleaseTotal}(借{_poolAcquireTotal}还{_poolReleaseTotal})");
         _mapCount5s = 0;
         _mapGapSum5s = 0;
         _copySum5s = 0;
@@ -622,20 +659,7 @@ public class GraphicsCaptureV3(bool captureHdr = false) : IGameCapture
         _sharedDedupHit5s = 0;
         _sharedReadback5s = 0;
         _lastDiagTime = now;
-        TrimIdleBgrLocked();
         _windowAcquireCount = 0;
-    }
-
-    private void TrimIdleBgrLocked()
-    {
-        if (_windowAcquireCount >= IdleTrimAcquireThreshold) return;
-        if (_bgrQueue.Count <= IdleRetainMax) return;
-        while (_bgrQueue.Count > IdleRetainMax)
-        {
-            if (!_bgrQueue.TryDequeue(out var stale)) break;
-            stale.Dispose();
-            _poolTrimmed++;
-        }
     }
 
     private void TrimBgrPoolForSizeLocked(int height, int width)
