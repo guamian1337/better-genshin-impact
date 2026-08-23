@@ -422,7 +422,7 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
         }
         catch (Exception e)
         {
-            Debug.WriteLine($"[WGC V2] GPU 打包 BGR 初始化失败，回退 CPU CvtColor: {e.Message}");
+            Debug.WriteLine($"[WGC V2] GPU 打包 BGR 初始化失败，回退 CPU CvtColor: {e.GetType().Name}: {e.Message}\n{e.StackTrace}");
             DisposePackResourcesLocked();
             _gpuPackFailed = true;
             return false;
