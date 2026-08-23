@@ -551,6 +551,21 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
     }
 
     /// <summary>
+    ///     整屏 BGRA 零拷贝直通：等价于 CaptureRawRegion(全区)。
+    ///     返回 CV_8UC4 视图（跳过池化与 CvtColor）；生命周期契约同 CaptureRawRegion
+    ///     —— Dispose 前始终有效。
+    /// </summary>
+    public GameCaptureFrame? CaptureRawFull()
+    {
+        lock (_lock)
+        {
+            if (_gpuTexture == null) return null;
+            var d = _gpuTexture.Description;
+            return CaptureRawRegion(0, 0, d.Width, d.Height);   // Monitor 同线程可重入
+        }
+    }
+
+    /// <summary>
     ///     零拷贝 ROI 直通：只把请求区域从广播纹理搬进小 staging，返回映射指针包装的
     ///     CV_8UC4 Mat（B,G,R,A 内存序）。跳过全屏读回与 CvtColor。
     ///     <para><b>生命周期契约（与 BitBltMat 同款）：</b>
