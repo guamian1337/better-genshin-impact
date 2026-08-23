@@ -66,11 +66,12 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
     private readonly Texture2D?[] _stagingTextures = new Texture2D?[2];
     private int _stagingIndex;
 
-    // 零拷贝 ROI 直通（CaptureRawRegion）：独立的小 staging 双缓冲，只搬运请求区域。
-    // 视图契约与 BitBltMat 同款：存活到「下下一次同环捕获」开始；跨两帧持有会读到覆写数据。
-    private readonly Texture2D?[] _roiStagingTextures = new Texture2D?[StagingCount];
-    private int _roiIndex;
-    private readonly HashSet<Texture2D> _mappedTextures = new();   // 所有处于 Mapped 状态的槽（跨环、支持多视图并存）
+    // 零拷贝 ROI 直通（CaptureRawRegion）：每个视图独占一块 staging 纹理（池化复用），
+    // Dispose 即 Unmap 并归还——无跨帧限制、无并发上限，多任务同时接入互不干扰。
+    // 池仅约束“闲置纹理”的缓存上限；在途视图按需新建，归还时超限即销毁。
+    private const int MaxRoiPoolSize = 8;
+    private readonly ConcurrentQueue<Texture2D> _roiTexPool = new();
+    private bool _roiPoolClosed = true;
 
     // Surface 大小
     private int _surfaceWidth;
@@ -213,6 +214,7 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
             lock (_lock)
             {
                 _bgrPoolClosed = false;
+                _roiPoolClosed = false;
             }
         }
         catch
@@ -320,46 +322,53 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
         }
     }
 
-    private void EnsureRoiStagingTextureLocked(SharpDX.Direct3D11.Device device, int index, int width, int height)
+    /// <summary>
+    ///     从 ROI 纹理池取一块指定尺寸的 staging；池空则新建。
+    ///     取出的纹理保证处于 Unmapped 状态（归还前统一释放映射）。
+    /// </summary>
+    private Texture2D AcquireRoiTextureLocked(SharpDX.Direct3D11.Device device, int width, int height)
     {
-        var tex = _roiStagingTextures[index];
-        if (tex == null || tex.Description.Width != width || tex.Description.Height != height)
+        while (_roiTexPool.TryDequeue(out var pooled))
         {
-            BeginSlotWriteLocked(tex);   // 该槽若处于 Mapped 状态，重建前强制释放
-            tex?.Dispose();
-            _roiStagingTextures[index] = Direct3D11Helper.CreateStagingTexture(device, width, height, null);
+            if (!pooled.IsDisposed &&
+                pooled.Description.Width == width &&
+                pooled.Description.Height == height)
+            {
+                return pooled;
+            }
+            pooled.Dispose();   // 尺寸不符/已废弃：直接销毁
         }
+        return Direct3D11Helper.CreateStagingTexture(device, width, height, null);
     }
 
-    /// <summary>目标纹理即将被写入/销毁：若处于 Mapped 状态则立即 Unmap 并移出登记簿</summary>
-    private void BeginSlotWriteLocked(Texture2D? tex)
+    /// <summary>视图释放回调：Unmap（若仍 mapped）并把纹理还池；超限/会话关闭则销毁</summary>
+    private void ReturnRoiTextureLocked(Texture2D tex)
     {
-        if (tex == null || !_mappedTextures.Remove(tex)) return;
         try
         {
-            tex.Device.ImmediateContext.UnmapSubresource(tex, 0);
-        }
-        catch
-        {
-            // 迟到释放容错
-        }
-    }
-
-    /// <summary>Unmap 所有仍处于 Mapped 状态的槽并清空登记簿（Stop/尺寸重建用）</summary>
-    private void UnmapAllMappedLocked()
-    {
-        foreach (var tex in _mappedTextures)
-        {
-            try
+            if (!tex.IsDisposed)
             {
                 tex.Device.ImmediateContext.UnmapSubresource(tex, 0);
             }
-            catch
-            {
-                // 迟到释放容错：纹理可能已被销毁
-            }
         }
-        _mappedTextures.Clear();
+        catch
+        {
+            // 设备已销毁等迟到释放容错
+        }
+
+        if (tex.IsDisposed || _roiPoolClosed)
+        {
+            tex.Dispose();
+            return;
+        }
+        if (_roiTexPool.Count < MaxRoiPoolSize)
+        {
+            _roiTexPool.Enqueue(tex);
+        }
+        else
+        {
+            tex.Dispose();
+        }
     }
 
     private static void HandleSharpDxError(SharpDXException e)
@@ -411,13 +420,7 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                             _stagingTextures[i] = null;
                         }
                         _stagingIndex = 0;
-            UnmapAllMappedLocked();
-                        for (var i = 0; i < StagingCount; i++)
-                        {
-                            _roiStagingTextures[i]?.Dispose();
-                            _roiStagingTextures[i] = null;
-                        }
-                        _roiIndex = 0;
+                        while (_roiTexPool.TryDequeue(out var staleRoi)) staleRoi.Dispose();
                         _frameReady = false;
                         _hdrOutputTexture?.Dispose();
                         _hdrOutputTexture = null;
@@ -499,8 +502,6 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
 
                 var stagingCur = _stagingTextures[curIdx]!;
                 var context = d3dDevice.ImmediateContext;
-                // 该槽若被某次 CaptureRawRegion 的视图占用，先 Unmap 再写入
-                BeginSlotWriteLocked(stagingCur);
                 // Stage 写 cur（GPU -> staging cur）
                 var qpcSubmit0 = Stopwatch.GetTimestamp();
                 context.CopyResource(_gpuTexture, stagingCur);
@@ -577,10 +578,7 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 var sh = Math.Min(height, desc.Height - sy);
                 if (sw <= 0 || sh <= 0) return null;
 
-                var curIdx = _roiIndex;
-                EnsureRoiStagingTextureLocked(d3dDevice, curIdx, sw, sh);
-                var roiTex = _roiStagingTextures[curIdx]!;
-                BeginSlotWriteLocked(roiTex);
+                var roiTex = AcquireRoiTextureLocked(d3dDevice, sw, sh);
 
                 var context = d3dDevice.ImmediateContext;
                 var region = new ResourceRegion
@@ -597,19 +595,19 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
 
                 var box = context.MapSubresource(roiTex, 0,
                     SharpDX.Direct3D11.MapMode.Read, SharpDX.Direct3D11.MapFlags.None);
-            _mappedTextures.Add(roiTex);
-                _roiIndex ^= 1;
 
                 GameCaptureFrame? frame = null;
                 try
                 {
-                    var view = Mat.FromPixelData(sh, sw, MatType.CV_8UC4, box.DataPointer, box.RowPitch);
+                    // 视图 Dispose 时：Unmap 并把纹理还池（超限销毁）
+                    var view = RoiViewMat.FromPixelData(sh, sw, box.DataPointer, box.RowPitch,
+                        () => ReturnRoiTextureLocked(roiTex));
                     frame = new GameCaptureFrame(view, new RECT(sx, sy, sx + sw, sy + sh));
                 }
                 catch
                 {
-                    // 构造失败立即释放映射，不占坑
-            UnmapAllMappedLocked();
+                    // 构造失败立即释放映射并回收纹理，不占坑
+                    ReturnRoiTextureLocked(roiTex);
                     throw;
                 }
 
@@ -816,14 +814,9 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 _stagingTextures[i] = null;
             }
             _stagingIndex = 0;
-            UnmapAllMappedLocked();
-            for (var i = 0; i < StagingCount; i++)
-            {
-                _roiStagingTextures[i]?.Dispose();
-                _roiStagingTextures[i] = null;
-            }
-            _roiIndex = 0;
             while (_bgrQueue.TryDequeue(out var pooled)) pooled.Dispose();
+            _roiPoolClosed = true;
+            while (_roiTexPool.TryDequeue(out var roiTex)) roiTex.Dispose();
             _bgrPoolClosed = true;
             _hdrOutputTexture?.Dispose();
             _hdrOutputTexture = null;
