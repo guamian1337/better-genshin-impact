@@ -319,17 +319,42 @@ public class BgiOnnxFactory
     /// <returns>InferenceSession</returns>
     public InferenceSession CreateInferenceSession(BgiOnnxModel model, bool ocr = false)
     {
-        _logger.LogDebug("[ONNX]创建推理会话，模型: {ModelName}", model.Name);
+        _logger.LogDebug("[ONNX]创建推理会话，模型: {ModelName} 路径: {Path}", model.Name, model.ModalPath);
         ProviderType[]? providerTypes = null;
         if (CpuOcr && ocr) providerTypes = [ProviderType.Cpu];
 
-        if (!EnableCache)
-            return new InferenceSession(model.ModalPath, CreateSessionOptions(model, false, providerTypes));
+        try
+        {
+            if (!EnableCache)
+                return new InferenceSession(model.ModalPath, CreateSessionOptions(model, false, providerTypes));
 
-        var cached = GetCached(model, providerTypes);
-        return cached == null
-            ? new InferenceSession(model.ModalPath, CreateSessionOptions(model, true, providerTypes))
-            : new InferenceSession(cached, CreateSessionOptions(model, false, providerTypes));
+            var cached = GetCached(model, providerTypes);
+            return cached == null
+                ? new InferenceSession(model.ModalPath, CreateSessionOptions(model, true, providerTypes))
+                : new InferenceSession(cached, CreateSessionOptions(model, false, providerTypes));
+        }
+        catch (KeyNotFoundException ex)
+        {
+            // OnnxRuntimeException 内部字典未包含新版 ErrorCode（如 13），二次抛 KeyNotFoundException 会吞掉原始 ONNX 错误
+            _logger.LogError(ex,
+                "[ONNX]创建推理会话失败：未知 ErrorCode，模型={Model} 路径={Path} 内部错误={Inner}，请检查 onnxruntime 版本与模型/EP 兼容性",
+                model.Name, model.ModalPath, ex.InnerException?.Message ?? ex.Message);
+            throw new InvalidOperationException(
+                $"[ONNX]模型 {model.Name} 初始化失败（未知 ErrorCode），请查看日志获取原始 ONNX 错误。路径: {model.ModalPath}", ex);
+        }
+        catch (OnnxRuntimeException ex)
+        {
+            _logger.LogError(ex,
+                "[ONNX]创建推理会话失败：模型={Model} 路径={Path} ErrorCode={Code} Message={Msg}",
+                model.Name, model.ModalPath,
+                ex.GetType().GetProperty("ErrorCode")?.GetValue(ex)?.ToString() ?? "unknown", ex.Message);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[ONNX]创建推理会话失败：模型={Model} 路径={Path}", model.Name, model.ModalPath);
+            throw;
+        }
     }
 
     /// <summary>

@@ -115,6 +115,12 @@ jobs:
       - name: 🛠️ Build application
         run: dotnet publish BetterGenshinImpact/BetterGenshinImpact.csproj -c Release -p:PublishProfile=FolderProfile -p:Version=${{ needs.validate.outputs.version }}
         continue-on-error: true
+      - name: 📦 Upload debug symbols (for crash line numbers)
+        uses: actions/upload-artifact@v4
+        with:
+          name: BetterGI_debug_symbols
+          path: BetterGenshinImpact\bin\x64\Release\net8.0-windows10.0.22621.0\publish\win-x64\**\*.pdb
+          if-no-files-found: warn
       - name: 🧹 Clear & Move Files
         run: |
             $sourceDir = ".\BetterGenshinImpact\bin\x64\Release\net8.0-windows10.0.22621.0\publish\win-x64"
