@@ -62,11 +62,28 @@ public class AutoMusicGameTask(AutoMusicGameParam taskParam) : ISoloTask
             // 计算按键位置
             using var gameCaptureRegion = CaptureToRectArea();
 
-            foreach (var keyValuePair in _keyX)
+            if (TaskContext.Instance().Config.AutoMusicGameConfig.UseCapturePipeline)
             {
-                var (x, y) = gameCaptureRegion.ConvertPositionToGameCaptureRegion((int)(keyValuePair.Value * assetScale), (int)(_keyY * assetScale));
-                // 添加任务
-                taskList.Add(Task.Run(async () => await DoWhitePressWin32(ct, keyValuePair.Key, new Point(x, y)), ct));
+                // 截图管线模式：单采集循环驱动全部键位（替代每键独立轮询，
+                // 把 Capture/CvtColor 频率压到帧率上限，同时消除高频唤醒的调度开销）
+                var keys = new List<(User32.VK Key, int X, int Y)>();
+                foreach (var keyValuePair in _keyX)
+                {
+                    var (x, y) = gameCaptureRegion.ConvertPositionToGameCaptureRegion((int)(keyValuePair.Value * assetScale), (int)(_keyY * assetScale));
+                    keys.Add((keyValuePair.Key, x, y));
+                }
+
+                var v2 = TaskTriggerDispatcher.GlobalGameCapture as Fischless.GameCapture.Graphics.GraphicsCaptureV2;
+                taskList.Add(Task.Run(() => DoWhitePressPipeline(ct, keys, v2), ct));
+            }
+            else
+            {
+                foreach (var keyValuePair in _keyX)
+                {
+                    var (x, y) = gameCaptureRegion.ConvertPositionToGameCaptureRegion((int)(keyValuePair.Value * assetScale), (int)(_keyY * assetScale));
+                    // 添加任务
+                    taskList.Add(Task.Run(async () => await DoWhitePressWin32(ct, keyValuePair.Key, new Point(x, y)), ct));
+                }
             }
 
             await Task.WhenAll(taskList);
@@ -83,8 +100,6 @@ public class AutoMusicGameTask(AutoMusicGameParam taskParam) : ISoloTask
         while (!ct.IsCancellationRequested)
         {
             await Task.Delay(5, ct);
-            // Stopwatch sw = new();
-            // sw.Start();
             var hdc = User32.GetDC(_hWnd);
             var c = Gdi32.GetPixel(hdc, point.X, point.Y);
             Gdi32.DeleteDC(hdc);
@@ -106,9 +121,92 @@ public class AutoMusicGameTask(AutoMusicGameParam taskParam) : ISoloTask
 
                 KeyUp(key);
             }
+        }
+    }
 
-            // sw.Stop();
-            // Debug.WriteLine($"GetPixel 耗时：{sw.ElapsedMilliseconds} （{point.X},{point.Y}）颜色{c.R},{c.G},{c.B}");
+    /// <summary>
+    ///     截图管线模式：单采集循环驱动全部键位。
+    ///     一个线程按固定节奏采集一次，内联检查所有键位的 B 通道并维护
+    ///     各键的按下状态机（最短按压 minHoldMs）。
+    ///     <para>V2 捕获下走 ROI 点采样快路径：只把键位横条搬进小 staging，
+    ///     免全屏读回与 CvtColor（4K 下收益最大）；其他捕获模式回退
+    ///     CaptureToRectArea 全屏路径，行为与旧版一致。</para>
+    /// </summary>
+    private async Task DoWhitePressPipeline(CancellationToken ct,
+        IReadOnlyList<(User32.VK Key, int X, int Y)> keys,
+        Fischless.GameCapture.Graphics.GraphicsCaptureV2? v2)
+    {
+        const int minHoldMs = 80;
+        const int marginX = 64;
+        const int marginY = 48;
+        var states = new bool[keys.Count];
+        var pressTicks = new long[keys.Count];
+
+        void SampleKey(int i, (User32.VK Key, int X, int Y) key, Mat mat, int ox, int oy)
+        {
+            var px = key.X - ox;
+            var py = key.Y - oy;
+            if ((uint)px >= (uint)mat.Width || (uint)py >= (uint)mat.Height) return;
+
+            var b = mat.At<Vec3b>(py, px).Item0;   // BGRA/BGR 内存序首字节均为 B
+            if (states[i])
+            {
+                if (b >= 220 && Environment.TickCount64 - pressTicks[i] >= minHoldMs)
+                {
+                    states[i] = false;
+                    KeyUp(key.Key);
+                }
+            }
+            else if (b < 220)
+            {
+                states[i] = true;
+                pressTicks[i] = Environment.TickCount64;
+                KeyDown(key.Key);
+            }
+        }
+
+        // ROI 包围盒：由键位推导，越界部分由 V2 内部收敛
+        var minX = int.MaxValue;
+        var minY = int.MaxValue;
+        var maxX = int.MinValue;
+        var maxY = int.MinValue;
+        foreach (var k in keys)
+        {
+            if (k.X < minX) minX = k.X;
+            if (k.X > maxX) maxX = k.X;
+            if (k.Y < minY) minY = k.Y;
+            if (k.Y > maxY) maxY = k.Y;
+        }
+
+        var roiX = Math.Max(0, minX - marginX);
+        var roiY = Math.Max(0, minY - marginY);
+        var roiW = (maxX + marginX) - roiX;
+        var roiH = (maxY + marginY) - roiY;
+
+        while (!ct.IsCancellationRequested)
+        {
+            await Task.Delay(5, ct);
+
+            if (v2 != null)
+            {
+                using var cap = v2.CaptureRawRegion(roiX, roiY, roiW, roiH);
+                if (cap == null || cap.Frame == null || cap.Frame.Empty()) continue;
+
+                for (var i = 0; i < keys.Count; i++)
+                {
+                    SampleKey(i, keys[i], cap.Frame, roiX, roiY);
+                }
+            }
+            else
+            {
+                using var cap = CaptureToRectArea();
+                if (cap == null || cap.SrcMat == null || cap.SrcMat.Empty()) continue;
+
+                for (var i = 0; i < keys.Count; i++)
+                {
+                    SampleKey(i, keys[i], cap.SrcMat, 0, 0);
+                }
+            }
         }
     }
 
