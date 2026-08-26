@@ -152,6 +152,7 @@ namespace BetterGenshinImpact.ViewModel
         private bool _fpsStarted;
         private CancellationTokenSource? _fpsCts;
         private int _fpsGeneration;
+        private readonly object _fpsLock = new();
 
         public MaskWindowViewModel()
         {
@@ -450,27 +451,43 @@ namespace BetterGenshinImpact.ViewModel
 
         private void StartGameFpsSampling()
         {
-            if (_fpsStarted)
+            CancellationTokenSource cts;
+            int generation;
+            lock (_fpsLock)
             {
-                return;
+                if (_fpsStarted)
+                {
+                    return;
+                }
+
+                // FPS 由 PresentMon 长任务持续采样，只有用户勾选游戏帧率时才启动一次，避免无意义后台采样。
+                // Start/Stop/采样任务收尾经 _fpsLock 串行化；Start/Stop 仅 UI 线程调用，锁粒度纳秒级，锁内不调用外部方法。
+                _fpsStarted = true;
+                generation = ++_fpsGeneration;
+                cts = new CancellationTokenSource();
+                _fpsCts = cts;
             }
 
-            // FPS 由 PresentMon 长任务持续采样，只有用户勾选游戏帧率时才启动一次，避免无意义后台采样。
-            // Start/Stop 仅在 UI 线程串行执行，代次用普通 int 递增即可；后台任务只读它做归属判定。
-            _fpsStarted = true;
-            var generation = ++_fpsGeneration;
+            var token = cts.Token;
             nint targetHWnd = TaskContext.Instance().GameHandle;
             _ = User32.GetWindowThreadProcessId(targetHWnd, out var pid);
-            _fpsCts = new CancellationTokenSource();
-            var cts = _fpsCts;
-            var token = cts.Token;
             Task.Run(async () =>
             {
                 try
                 {
+                    // 库用固定名 ETW 内核会话，快速关→开或上次进程被杀会残留同名会话导致构造失败，启动前先清掉
+                    try
+                    {
+                        FpsInspector.StopTraceSession();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "清理残留 PresentMon 会话失败，继续尝试启动");
+                    }
+
                     await FpsInspector.StartForeverAsync(new FpsRequest(pid), result =>
                     {
-                        if (generation != _fpsGeneration)
+                        if (Volatile.Read(ref _fpsGeneration) != generation)
                         {
                             return;
                         }
@@ -479,10 +496,6 @@ namespace BetterGenshinImpact.ViewModel
                         _overlayMetricsService?.UpdateGameFps(result.Fps);
                     }, token);
                 }
-                catch (OperationCanceledException)
-                {
-                    // 用户取消勾选游戏帧率指标后正常退出采样循环
-                }
                 catch (Exception ex)
                 {
                     // 采样初始化失败（如游戏句柄无效、ETW 会话创建失败）只记录并复位，允许下次勾选重新启动
@@ -490,11 +503,23 @@ namespace BetterGenshinImpact.ViewModel
                 }
                 finally
                 {
-                    // 仅当代次仍属于本任务时才复位状态，避免异常退出路径误清新启动任务的归属
-                    if (generation == _fpsGeneration)
+                    bool retired = false;
+                    lock (_fpsLock)
                     {
-                        _fpsCts = null;
-                        _fpsStarted = false;
+                        // 仅当代次仍属于本任务时才复位，避免误清新启动任务的归属
+                        if (generation == _fpsGeneration)
+                        {
+                            _fpsCts = null;
+                            _fpsStarted = false;
+                            retired = true;
+                        }
+                    }
+
+                    if (retired)
+                    {
+                        // 异常/自然退出都诚实清空展示与缓存，避免冻结值持续展示
+                        Fps = "0";
+                        _overlayMetricsService?.ClearGameFps();
                     }
                 }
             });
@@ -502,23 +527,31 @@ namespace BetterGenshinImpact.ViewModel
 
         private void StopGameFpsSampling()
         {
-            if (!_fpsStarted)
+            CancellationTokenSource? cts;
+            lock (_fpsLock)
             {
-                return;
+                // 幂等收尾：采样任务异常自复位后再次进入也能补清展示与缓存
+                _fpsStarted = false;
+                // 先递增代次使在途回调立即失效，再清空缓存，防止过期帧写回
+                _fpsGeneration++;
+                cts = _fpsCts;
+                _fpsCts = null;
             }
 
-            _fpsStarted = false;
-            // 先递增代次使在途回调立即失效，再清空缓存，防止过期帧写回
-            _fpsGeneration++;
-            var cts = _fpsCts;
-            _fpsCts = null;
             if (cts != null)
             {
                 // Cancel 会在调用线程同步执行 token 注册的回调，挪到线程池执行，避免潜在慢回调拖住 UI
                 Task.Run(() =>
                 {
-                    cts.Cancel();
-                    cts.Dispose();
+                    try
+                    {
+                        cts.Cancel();
+                        cts.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "取消游戏帧率采样任务失败");
+                    }
                 });
             }
 
