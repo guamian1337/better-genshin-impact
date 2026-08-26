@@ -151,6 +151,7 @@ namespace BetterGenshinImpact.ViewModel
         private bool _metricsSubscribed;
         private bool _fpsStarted;
         private CancellationTokenSource? _fpsCts;
+        private int _fpsGeneration;
 
         public MaskWindowViewModel()
         {
@@ -455,18 +456,21 @@ namespace BetterGenshinImpact.ViewModel
             }
 
             // FPS 由 PresentMon 长任务持续采样，只有用户勾选游戏帧率时才启动一次，避免无意义后台采样。
+            // Start/Stop 仅在 UI 线程串行执行，代次用普通 int 递增即可；后台任务只读它做归属判定。
             _fpsStarted = true;
+            var generation = ++_fpsGeneration;
             nint targetHWnd = TaskContext.Instance().GameHandle;
             _ = User32.GetWindowThreadProcessId(targetHWnd, out var pid);
             _fpsCts = new CancellationTokenSource();
-            var token = _fpsCts.Token;
+            var cts = _fpsCts;
+            var token = cts.Token;
             Task.Run(async () =>
             {
                 try
                 {
                     await FpsInspector.StartForeverAsync(new FpsRequest(pid), result =>
                     {
-                        if (token.IsCancellationRequested)
+                        if (generation != _fpsGeneration)
                         {
                             return;
                         }
@@ -479,6 +483,20 @@ namespace BetterGenshinImpact.ViewModel
                 {
                     // 用户取消勾选游戏帧率指标后正常退出采样循环
                 }
+                catch (Exception ex)
+                {
+                    // 采样初始化失败（如游戏句柄无效、ETW 会话创建失败）只记录并复位，允许下次勾选重新启动
+                    _logger.LogWarning(ex, "游戏帧率采样任务异常退出");
+                }
+                finally
+                {
+                    // 仅当代次仍属于本任务时才复位状态，避免异常退出路径误清新启动任务的归属
+                    if (generation == _fpsGeneration)
+                    {
+                        _fpsCts = null;
+                        _fpsStarted = false;
+                    }
+                }
             });
         }
 
@@ -490,12 +508,18 @@ namespace BetterGenshinImpact.ViewModel
             }
 
             _fpsStarted = false;
+            // 先递增代次使在途回调立即失效，再清空缓存，防止过期帧写回
+            _fpsGeneration++;
             var cts = _fpsCts;
             _fpsCts = null;
             if (cts != null)
             {
-                cts.Cancel();
-                cts.Dispose();
+                // Cancel 会在调用线程同步执行 token 注册的回调，挪到线程池执行，避免潜在慢回调拖住 UI
+                Task.Run(() =>
+                {
+                    cts.Cancel();
+                    cts.Dispose();
+                });
             }
 
             Fps = "0";

@@ -22,6 +22,7 @@ public sealed class OverlayMetricsService : IDisposable
     private static readonly TimeSpan HardwareRefreshInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan GpuQueryResetInterval = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan PeakProcessingCostWindow = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan StaleCpuBaselineInterval = TimeSpan.FromSeconds(5);
 
     private readonly ILogger<OverlayMetricsService> _logger = App.GetLogger<OverlayMetricsService>();
     private readonly IConfigService? _configService = App.GetService<IConfigService>();
@@ -517,6 +518,14 @@ public sealed class OverlayMetricsService : IDisposable
 
             var cpuDelta = (currentCpuTime - _lastBgiCpuTime).TotalSeconds;
             var timeDelta = (now - _lastBgiCpuSampleTime).TotalSeconds;
+
+            // 指标停用期间或休眠恢复后基线已过期，跨大时间窗的平均值会明显偏离当前负载，只重建基线不发布
+            if (timeDelta > StaleCpuBaselineInterval.TotalSeconds)
+            {
+                _lastBgiCpuTime = currentCpuTime;
+                _lastBgiCpuSampleTime = now;
+                return null;
+            }
 
             _lastBgiCpuTime = currentCpuTime;
             _lastBgiCpuSampleTime = now;
