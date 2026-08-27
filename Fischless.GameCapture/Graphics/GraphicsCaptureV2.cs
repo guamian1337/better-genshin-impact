@@ -161,6 +161,10 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
 
             _d3dDevice = Direct3D11Helper.CreateDevice();
 
+            // CreateFreeThreaded 契约：FrameArrived/Closed 派发于 WGC 内部队列线程，
+            // 不依赖启动线程的 DispatcherQueue/消息泵（热键线程、脚本后台链启动均可正常收帧）。
+            // 帧池访问(TryGetNextFrame/Recreate/Dispose)与 GPU 资源操作必须在 _lock 内串行；
+            // WinEventHook 仍在启动线程注册，仅对 _sizeDirty 做锁外原子置位。
             try
             {
                 if (!_isHdrEnabled)
@@ -169,7 +173,7 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 }
 
                 _pixelFormat = DirectXPixelFormat.R16G16B16A16Float;
-                _captureFramePool = Direct3D11CaptureFramePool.Create(
+                _captureFramePool = Direct3D11CaptureFramePool.CreateFreeThreaded(
                     _d3dDevice,
                     _pixelFormat,
                     2,
@@ -178,7 +182,7 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
             catch (Exception)
             {
                 _pixelFormat = DirectXPixelFormat.B8G8R8A8UIntNormalized;
-                _captureFramePool = Direct3D11CaptureFramePool.Create(
+                _captureFramePool = Direct3D11CaptureFramePool.CreateFreeThreaded(
                     _d3dDevice,
                     _pixelFormat,
                     2,
@@ -385,21 +389,25 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
         // 兜底：任何异常不得穿透 WinRT 回调线程（否则可能直接崩溃进程）
         try
         {
-            if (_hWnd == 0) return;
-            using var frame = sender.TryGetNextFrame();
-            if (frame == null) return;
-
             var now = _frameTimer.ElapsedMilliseconds;
 
-            if (_sizeDirty || now - _lastSizeFallbackCheckMs >= SizeFallbackCheckMs)
+            // FreeThreaded 派发线程与消费/Stop 线程并发，全部串行在单锁内
+            lock (_lock)
             {
-                var regionDirty = _sizeDirty;
-                _lastSizeFallbackCheckMs = now;
-                _sizeDirty = false;
-                lock (_lock)
+                // Stop() 迟到回调防护：会话已结束则放弃本帧（防 NRE / 幽灵纹理复活）
+                if (!IsCapturing || _captureItem == null || _captureFramePool == null || _d3dDevice == null) return;
+                if (_hWnd == 0) return;
+
+                using var frame = sender.TryGetNextFrame();
+                if (frame == null) return;
+
+                // 尺寸脏标志清零与 fallback 节流统一在锁内；
+                // 置位方 WinEventProc(UI hook 线程) 为锁外原子写 true
+                if (_sizeDirty || now - _lastSizeFallbackCheckMs >= SizeFallbackCheckMs)
                 {
-                    // Stop() 迟到回调防护：会话已结束则放弃本帧（防 NRE / 幽灵纹理复活）
-                    if (!IsCapturing || _captureItem == null || _captureFramePool == null || _d3dDevice == null) return;
+                    var regionDirty = _sizeDirty;
+                    _lastSizeFallbackCheckMs = now;
+                    _sizeDirty = false;
 
                     var captureSize = _captureItem.Size;
                     if (captureSize.Width != _surfaceWidth || captureSize.Height != _surfaceHeight)
@@ -435,13 +443,8 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                         (_region, _captureRect) = GetGameScreenInfo(_hWnd);
                     }
                 }
-            }
 
-            using var surfaceTexture = Direct3D11Helper.CreateSharpDXTexture2D(frame.Surface);
-            lock (_lock)
-            {
-                // Stop 迟到回调防护：防 EnsureGpuTexture 复活幽灵纹理
-                if (!IsCapturing) return;
+                using var surfaceTexture = Direct3D11Helper.CreateSharpDXTexture2D(frame.Surface);
                 var sourceTexture = _isHdrEnabled ? ProcessHdrTexture(surfaceTexture) : surfaceTexture;
                 var d3dDevice = sourceTexture.Device;
                 EnsureGpuTexture(d3dDevice, frame.ContentSize.Width, frame.ContentSize.Height, _region);
