@@ -432,10 +432,12 @@ public class BgiOnnxFactory
                         break;
                     case ProviderType.Cpu:
                         sessionOptions.AppendExecutionProvider_CPU();
+                        // OCR 等小模型推理间隙 worker 自旋等待的开销远超计算本体（VTune 实测：WorkerLoop 自旋 85.9s vs MLAS 计算内核 4.8s），关闭自旋让线程池空闲时休眠
+                        sessionOptions.AddSessionConfigEntry("session.intra_op.allow_spinning", "0");
                         // if (model.Name.Contains("PpOcr") || model.Name.Contains("Yap"))
                         // {
                         //     sessionOptions.IntraOpNumThreads = 2;  // 限制算子内部并行线程数
-                        //     sessionOptions.InterOpNumThreads = 1;  // 限制算子间并行线程数（顺序执行）  
+                        //     sessionOptions.InterOpNumThreads = 1;  // 限制算子间并行执行（顺序执行）
                         // }
                         break;
                     case ProviderType.Dnnl:

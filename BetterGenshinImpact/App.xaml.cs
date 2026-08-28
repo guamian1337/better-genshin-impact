@@ -247,6 +247,8 @@ public partial class App : Application
     protected override async void OnStartup(StartupEventArgs e)
     {
         Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.Normal;
+        // OpenCV 并行后端为 PPL，默认每逻辑核一个 worker（14核机=14个），帧级小任务唤醒风暴造成线程池大规模排队等待（VTune r008: 110s），限到 4 个
+        OpenCvSharp.Cv2.SetNumThreads(4);
         // Wine 平台适配
         WinePlatformAddon.ApplyApplicationConfig();
         base.OnStartup(e);
