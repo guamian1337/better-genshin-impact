@@ -302,7 +302,7 @@ public class CombatScenes : IDisposable
             // 降低琴和衣装角色的识别率要求
             if (topClass.Confidence < 0.51)
             {
-                img.SaveAsPng(Global.Absolute($@"log\avatar_side_classify_error.png"));
+                SaveClassifyErrorSample(img);
                 throw new Exception(
                     $"无法识别第{index}位角色，置信度{topClass.Confidence:F1}，结果：{topClass.Name.Name}。请重新阅读 BetterGI 文档中的《快速上手》！");
             }
@@ -311,13 +311,27 @@ public class CombatScenes : IDisposable
         {
             if (topClass.Confidence < 0.7)
             {
-                img.SaveAsPng(Global.Absolute($@"log\avatar_side_classify_error.png"));
+                SaveClassifyErrorSample(img);
                 throw new Exception(
                     $"无法识别第{index}位角色，置信度{topClass.Confidence:F1}，结果：{topClass.Name.Name}。请重新阅读 BetterGI 文档中的《快速上手》！");
             }
         }
 
         return topClass.Name.Name;
+    }
+
+    private static long _lastClassifyErrorPngTicks = -60_000;
+
+    /// <summary>
+    /// 识别失败现场留存，限频 60s：连续识别失败时反复写 PNG 会造成磁盘 IO 突发（并被杀软扫描放大）
+    /// </summary>
+    private static void SaveClassifyErrorSample(Image<Rgb24> img)
+    {
+        var now = Environment.TickCount64;
+        var last = Interlocked.Read(ref _lastClassifyErrorPngTicks);
+        if (now - last < 60_000) return;
+        if (Interlocked.CompareExchange(ref _lastClassifyErrorPngTicks, now, last) != last) return;
+        img.SaveAsPng(Global.Absolute(@"log\avatar_side_classify_error.png"));
     }
 
     private void InitializeTeamFromConfig(string teamNames, AutoFightConfig autoFightConfig)
