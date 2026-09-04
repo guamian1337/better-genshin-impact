@@ -1,5 +1,6 @@
 ﻿using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using Fischless.GameCapture.Graphics.Helpers;
 using SharpDX.Direct3D11;
 using Vanara.PInvoke;
@@ -43,46 +44,73 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
 
     private readonly object _lock = new();
 
-    // 单 GPU 广播源：FrameArrived 每帧一次 GPU->GPU 拷贝（latest-wins），消费侧 Capture() 从它 stage 读回
-    private Texture2D? _gpuTexture;
-    private volatile bool _frameReady;
+    // FFmpeg gfxcapture 式限流：MinUpdateInterval 把 DWM 推帧率限到消费需求率（26100+，接口 QI 调用，见 TryApplyMinUpdateInterval）
+    private Windows.Graphics.SizeInt32 _capSize;
+    private long _minUpdateIntervalHns = 10_000_000L / 60;   // 默认 60fps（≈16.7ms），WinRT TimeSpan（100ns 单位）
 
-    // 单一 staging：消费时从 _gpuTexture 提交 GPU 拷贝并同 tick 阻塞 Map（等待通常亚毫秒级，无流水滞后）。
+    // IGraphicsCaptureSession5 {67C0EA62-1F85-5061-925A-239BE0AC09CB}
+    private static readonly Guid GraphicsCaptureSession5Iid = new("67C0EA62-1F85-5061-925A-239BE0AC09CB");
+
+    // vtable 布局：IUnknown 0-2 + IInspectable 3-5 + get_MinUpdateInterval 6 + put_MinUpdateInterval 7
+    private const int PutMinUpdateIntervalVtableSlot = 7;
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int PutMinUpdateIntervalDelegate(IntPtr pThis, long duration);
+
+    // 单一 staging：消费时从最新帧表面提交 GPU 拷贝并同 tick 阻塞 Map（等待通常亚毫秒级）。
     // 消费被 _captureGate 串行化，单块 staging 即安全
     private Texture2D? _stagingTexture;
 
-    // 单飞闸门：并发消费方逐个进入；FrameArrived 只用 _lock，不受此闸门影响
+    // 单飞闸门：并发消费方逐个进入
     private readonly object _captureGate = new();
 
     // 在途捕获数（正持锁外 Map/CvtColor）。Stop 与尺寸 Recreate 销毁 staging 前必须等其归零；仅锁内访问
     private int _activeCaptures;
 
-    // 无新帧跳过读回：识别节拍与帧到达率解耦——窗口静止时 FrameArrived 不触发，但识别 tick 仍在跑，
-    // 若无缓存，每个 tick 都会对同一块旧纹理重复 stage 拷贝 + Map 回读 + CvtColor（三重空转）。
-    // 策略：仅在真的出现重复 tick 时才建/用缓存，持续更新的场景（游戏）零额外开销。
-    // 三个时间戳/缓存仅在 _captureGate（单飞）内写；读侧 _lastArrivedFrameTs 在 _lock 内写
+    // 无新帧跳过读回：消费时 TryGetNextFrame 为空（池已排空，无新内容），克隆缓存直接返回，
+    // 避免对旧内容重复 GPU/PCIe 回读空转。缓存常建：每次消费新帧时 CvtColor 写入缓存 + 克隆给消费者
     private Mat? _cachedBgr;
-    private long _lastArrivedFrameTs;    // 最近到达帧的 SystemRelativeTime（_lock 内写）
-    private long _lastConsumedFrameTs;   // 最近一次成功消费帧的时间戳
     private long _cachedFrameTs;         // 缓存内容对应的帧时间戳
 
-    // Surface 大小
-    private int _surfaceWidth;
-    private int _surfaceHeight;
+    // 单 GPU 广播源：FrameArrived（DWM 写完、所有权刚释放的时机）用像素着色器一次 draw 渲染写入
+    // （FFmpeg gfxcapture 同款）。实测：消费时刻直接从跨进程表面回读会固定等待一个 DWM 周期（~20ms/帧），
+    // 到达时写入则无此等待
+    private Texture2D? _gpuTexture;
+    private RenderTargetView? _gpuTextureRtv;
+    private long _gpuFrameTs;            // _gpuTexture 当前内容对应帧的时间戳（_lock 内写）
 
-    // WinEventHook：尺寸/位置变化时才查询 get_Size
-    private User32.HWINEVENTHOOK _winEventHookMoveSize;
-    private User32.HWINEVENTHOOK _winEventHookLocation;
-    private User32.WinEventProc _winEventProc = null!;
-    private const uint EVENT_SYSTEM_MOVESIZESTART = 0x000A;
-    private const uint EVENT_SYSTEM_MOVESIZEEND = 0x000B;
-    private const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
-    private const uint WINEVENT_SKIPOWNTHREAD = 0x0001;
-    private const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
-    private volatile bool _sizeDirty = true;
+    // draw 写入资源（FFmpeg gfxcapture 的全屏三角形 + 采样，客户区裁剪折进 UV 窗口）
+    private VertexShader? _drawVs;
+    private PixelShader? _drawPs;
+    private SamplerState? _drawSampler;
+    private SharpDX.Direct3D11.Buffer? _drawCb;
 
-    // 驱动尺寸变化 3s fallback 检查
-    private readonly Stopwatch _frameTimer = new();
+    private const string DrawShaderSrc = @"
+        cbuffer cb : register(b0) { float4 uvWindow; }
+        Texture2D t0 : register(t0);
+        SamplerState s0 : register(s0);
+        struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+        VSOut main_vs(uint id : SV_VertexID) {
+            VSOut o;
+            o.pos = float4(id == 2 ? 3.0 : -1.0, id == 1 ? 3.0 : -1.0, 0, 1);
+            o.uv = lerp(uvWindow.xy, uvWindow.zw, float2((o.pos.x + 1) * 0.5, 1 - (o.pos.y + 1) * 0.5));
+            return o;
+        }
+        float4 main_ps(VSOut i) : SV_Target { return t0.Sample(s0, i.uv); }
+    ";
+
+    // A/B 开关：true = FFmpeg 式 draw 写入；false = 旧版 CopySubresourceRegion 拷贝写入
+    private bool _useDrawWrite = true;
+
+    // 诊断计数（仅 _captureGate 内访问）：定位刷新/占用问题时用 DebugView 查看
+    private long _diagTicks;
+    private long _diagFrames;
+    private long _diagCacheHits;
+    private long _diagRecreates;
+    private double _sumStageMs;
+    private double _sumMapMs;
+    private double _sumCvtMs;
+    private double _sumCloneMs;
 
     public void Dispose()
     {
@@ -92,7 +120,7 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
 
     public void Start(nint hWnd, Dictionary<string, object>? settings = null)
     {
-        // 全程持锁，防并发双 Start 泄漏 framepool/session/hook（Monitor 可重入，内部 Stop 安全）
+            // 全程持锁，防并发双 Start 泄漏 framepool/session（Monitor 可重入，内部 Stop 安全）
         lock (_lock)
         {
             StartCore(hWnd, settings);
@@ -105,6 +133,36 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
         try
         {
             _hWnd = hWnd;
+
+            // 识别节拍可通过 settings 传入（键 MinUpdateIntervalMs，毫秒）；默认 60fps（≈16.7ms）
+            if (settings?.TryGetValue("MinUpdateIntervalMs", out var intervalObj) == true)
+            {
+                try
+                {
+                    var ms = Convert.ToInt64(intervalObj);
+                    if (ms > 0)
+                    {
+                        _minUpdateIntervalHns = ms * 10_000L;
+                    }
+                }
+                catch
+                {
+                    // 非法值忽略，保持默认
+                }
+            }
+
+            // 到达侧写入方式开关（A/B 对比用）
+            if (settings?.TryGetValue("DisableDrawWrite", out var disableDrawWriteObj) == true)
+            {
+                try
+                {
+                    _useDrawWrite = !Convert.ToBoolean(disableDrawWriteObj);
+                }
+                catch
+                {
+                    // 非法值忽略
+                }
+            }
 
             (_region, _captureRect) = GetGameScreenInfo(hWnd);
 
@@ -125,15 +183,12 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 throw new InvalidOperationException("Failed to create capture item.");
             }
 
-            _surfaceWidth = _captureItem.Size.Width;
-            _surfaceHeight = _captureItem.Size.Height;
+            _capSize = _captureItem.Size;
 
             _d3dDevice = Direct3D11Helper.CreateDevice();
 
-            // CreateFreeThreaded 契约：FrameArrived/Closed 派发于 WGC 内部队列线程，
-            // 不依赖启动线程的 DispatcherQueue/消息泵（热键线程、脚本后台链启动均可正常收帧）。
-            // 帧池访问(TryGetNextFrame/Recreate/Dispose)与 GPU 资源操作必须在 _lock 内串行；
-            // WinEventHook 仍在启动线程注册，仅对 _sizeDirty 做锁外原子置位。
+            // CreateFreeThreaded 契约：帧池对象可跨线程访问，不依赖 DispatcherQueue/消息泵；
+            // TryGetNextFrame/Recreate 由消费线程在 _lock 内调用（FFmpeg gfxcapture 同款需求驱动模型）
             try
             {
                 if (!_isHdrEnabled)
@@ -162,12 +217,6 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
             _captureItem.Closed += CaptureItemOnClosed;
             _captureFramePool.FrameArrived += OnFrameArrived;
 
-            _winEventProc = WinEventProc;
-            var winEventFlags = (User32.WINEVENT)(WINEVENT_SKIPOWNPROCESS | WINEVENT_SKIPOWNTHREAD);
-            _winEventHookMoveSize = User32.SetWinEventHook(EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND, default, _winEventProc, 0, 0, winEventFlags);
-            _winEventHookLocation = User32.SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, default, _winEventProc, 0, 0, winEventFlags);
-            _sizeDirty = true;
-
             _captureSession = _captureFramePool.CreateCaptureSession(_captureItem);
             if (ApiInformation.IsPropertyPresent("Windows.Graphics.Capture.GraphicsCaptureSession",
                     nameof(GraphicsCaptureSession.IsCursorCaptureEnabled)))
@@ -181,8 +230,11 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 _captureSession.IsBorderRequired = false;
             }
 
-            _frameTimer.Start();
+            // FFmpeg gfxcapture 同款：StartCapture 前设置最小更新间隔，把推帧率限到消费需求率
+            TryApplyMinUpdateInterval(_captureSession);
+
             _captureSession.StartCapture();
+            Debug.WriteLine($"[WGC V2] Start 完成: hdr={_isHdrEnabled}, fmt={_pixelFormat}, minUpdateInterval={_minUpdateIntervalHns / 10000.0:0.##}ms, capSize={_capSize.Width}x{_capSize.Height}");
             IsCapturing = true;
             lock (_lock)
             {
@@ -267,6 +319,8 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
             _gpuTexture.Description.Width != w ||
             _gpuTexture.Description.Height != h)
         {
+            _gpuTextureRtv?.Dispose();
+            _gpuTextureRtv = null;
             _gpuTexture?.Dispose();
             _gpuTexture = new Texture2D(device, new Texture2DDescription
             {
@@ -278,10 +332,33 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 SampleDescription = new SampleDescription(1, 0),
                 Usage = ResourceUsage.Default,
                 CpuAccessFlags = CpuAccessFlags.None,
-                BindFlags = BindFlags.None,
+                BindFlags = BindFlags.RenderTarget,
                 OptionFlags = ResourceOptionFlags.None,
             });
+            _gpuTextureRtv = new RenderTargetView(device, _gpuTexture);
         }
+    }
+
+    private void EnsureDrawResources(SharpDX.Direct3D11.Device device)
+    {
+        if (_drawVs != null) return;
+
+        using var vsBlob = ShaderBytecode.Compile(DrawShaderSrc, "main_vs", "vs_5_0");
+        using var psBlob = ShaderBytecode.Compile(DrawShaderSrc, "main_ps", "ps_5_0");
+        _drawVs = new VertexShader(device, vsBlob);
+        _drawPs = new PixelShader(device, psBlob);
+        _drawSampler = new SamplerState(device, new SamplerStateDescription
+        {
+            Filter = Filter.MinMagMipLinear,
+            AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp,
+            AddressW = TextureAddressMode.Clamp,
+            // 结构体默认值 0 对 D3D11_COMPARISON_FUNC 是非法枚举，必须显式设置（否则 CreateSamplerState E_INVALIDARG）
+            ComparisonFunction = Comparison.Never,
+            MinimumLod = 0,
+            MaximumLod = float.MaxValue,
+        });
+        _drawCb = new SharpDX.Direct3D11.Buffer(device, 16, ResourceUsage.Dynamic, BindFlags.ConstantBuffer, CpuAccessFlags.Write, ResourceOptionFlags.None, 0);
     }
 
     private void EnsureStagingTextureLocked(SharpDX.Direct3D11.Device device, int width, int height)
@@ -305,89 +382,125 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
 
     private void OnFrameArrived(Direct3D11CaptureFramePool sender, object args)
     {
-        // 兜底：任何异常不得穿透 WinRT 回调线程（否则可能直接崩溃进程）
         try
         {
-            var now = _frameTimer.ElapsedMilliseconds;
-
-            // FreeThreaded 派发线程与消费/Stop 线程并发，全部串行在单锁内
+            // 到达时机 = DWM 写完该帧、所有权刚释放——此时拷贝无跨进程同步等待
             lock (_lock)
             {
-                // Stop() 迟到回调防护：会话已结束则放弃本帧（防 NRE / 幽灵纹理复活）
-                if (!IsCapturing || _captureItem == null || _captureFramePool == null || _d3dDevice == null) return;
-                if (_hWnd == 0) return;
+                if (!IsCapturing || _captureFramePool == null || _d3dDevice == null) return;
 
                 using var frame = sender.TryGetNextFrame();
                 if (frame == null) return;
 
-                _lastArrivedFrameTs = frame.SystemRelativeTime.Ticks;
+                var frameTs = frame.SystemRelativeTime.Ticks;
 
-                // 尺寸脏标志清零与 fallback 节流统一在锁内；
-                // 置位方 WinEventProc(UI hook 线程) 为锁外原子写 true
-                if (_sizeDirty || now - _lastSizeFallbackCheckMs >= SizeFallbackCheckMs)
+                // ContentSize 变化 → Recreate + 刷新客户区（FFmpeg gfxcapture 同款）
+                var contentSize = frame.ContentSize;
+                if (contentSize.Width != _capSize.Width || contentSize.Height != _capSize.Height)
                 {
-                    var regionDirty = _sizeDirty;
-                    _lastSizeFallbackCheckMs = now;
-                    _sizeDirty = false;
+                    _diagRecreates++;
+                    Debug.WriteLine($"[WGC V2] Recreate: {_capSize.Width}x{_capSize.Height} -> {contentSize.Width}x{contentSize.Height}");
+                    _captureFramePool.Recreate(_d3dDevice, _pixelFormat, 2, contentSize);
+                    _capSize = contentSize;
+                    (_region, _captureRect) = GetGameScreenInfo(_hWnd);
 
-                    var captureSize = _captureItem.Size;
-                    if (captureSize.Width != _surfaceWidth || captureSize.Height != _surfaceHeight)
+                    // 先挡住新的 Capture()，再等在途捕获退出（其可能正在锁外 Map staging/读缓存），
+                    // 之后才允许销毁资源，否则会踩到已释放纹理
+                    while (_activeCaptures > 0)
                     {
-                        if (User32.IsIconic(_hWnd)) return;
-                        _captureFramePool.Recreate(_d3dDevice, _pixelFormat, 2, captureSize);
-                        _surfaceWidth = captureSize.Width;
-                        _surfaceHeight = captureSize.Height;
-                        (_region, _captureRect) = GetGameScreenInfo(_hWnd);
-                        var newW = _region != null ? _region.Value.Right - _region.Value.Left : captureSize.Width;
-                        var newH = _region != null ? _region.Value.Bottom - _region.Value.Top : captureSize.Height;
-                        TrimBgrPoolForSizeLocked(newH, newW);
-
-                        // 先挡住新的 Capture()，再等在途捕获退出（其可能正在锁外 Map staging/读缓存），
-                        // 之后才允许销毁资源，否则会踩到已释放纹理
-                        _frameReady = false;
-                        while (_activeCaptures > 0)
-                        {
-                            Monitor.Wait(_lock);
-                        }
-
-                        _gpuTexture?.Dispose();
-                        _gpuTexture = null;
-                        _stagingTexture?.Dispose();
-                        _stagingTexture = null;
-                        _cachedBgr?.Dispose();
-                        _cachedBgr = null;
-                        _cachedFrameTs = 0;
-                        _lastConsumedFrameTs = 0;
-                        _lastArrivedFrameTs = 0;
-                        _hdrOutputTexture?.Dispose();
-                        _hdrOutputTexture = null;
-                        _hdrOutputUav?.Dispose();
-                        _hdrOutputUav = null;
-                        return;
+                        Monitor.Wait(_lock);
                     }
 
-                    // 纯移动窗口不改尺寸时也需刷新裁剪区，否则 region 错位
-                    if (regionDirty)
-                    {
-                        (_region, _captureRect) = GetGameScreenInfo(_hWnd);
-                    }
+                    _gpuTexture?.Dispose();
+                    _gpuTexture = null;
+                    _stagingTexture?.Dispose();
+                    _stagingTexture = null;
+                    _cachedBgr?.Dispose();
+                    _cachedBgr = null;
+                    _cachedFrameTs = 0;
+                    _gpuFrameTs = 0;
+                    _hdrOutputTexture?.Dispose();
+                    _hdrOutputTexture = null;
+                    _hdrOutputUav?.Dispose();
+                    _hdrOutputUav = null;
+                    return;
                 }
 
-                // 每帧一次 GPU->GPU 拷贝（latest-wins），消费侧 Capture() 从 _gpuTexture stage 读回
-                using var surfaceTexture = Direct3D11Helper.CreateSharpDXTexture2D(frame.Surface);
-                var sourceTexture = _isHdrEnabled ? ProcessHdrTexture(surfaceTexture) : surfaceTexture;
-                var d3dDevice = sourceTexture.Device;
-                EnsureGpuTexture(d3dDevice, frame.ContentSize.Width, frame.ContentSize.Height, _region);
+                using var surface = Direct3D11Helper.CreateSharpDXTexture2D(frame.Surface);
+                var source = _isHdrEnabled ? ProcessHdrTexture(surface) : surface;
+                var d3dDevice = source.Device;
+                EnsureGpuTexture(d3dDevice, contentSize.Width, contentSize.Height, _region);
+                EnsureDrawResources(d3dDevice);
                 var context = d3dDevice.ImmediateContext;
-                if (_region != null)
+
+                if (_useDrawWrite)
                 {
-                    context.CopySubresourceRegion(sourceTexture, 0, _region, _gpuTexture, 0);
+                // FFmpeg gfxcapture 式 draw 写入：客户区裁剪折进 UV 窗口，一次 draw 渲染进自有纹理
+                var drawStage = "EnsureDrawResources";
+                try
+                {
+                    EnsureDrawResources(d3dDevice);
+
+                    var srcW = source.Description.Width;
+                    var srcH = source.Description.Height;
+                    var region = _region;
+                    var uvMinX = region == null ? 0f : region.Value.Left / (float)srcW;
+                    var uvMinY = region == null ? 0f : region.Value.Top / (float)srcH;
+                    var uvMaxX = region == null ? 1f : region.Value.Right / (float)srcW;
+                    var uvMaxY = region == null ? 1f : region.Value.Bottom / (float)srcH;
+
+                    drawStage = "MapConstantBuffer";
+                    // 必须 WriteDiscard：cb 仍绑定在上一帧 draw 的 PS 槽上，普通 Write 会 E_INVALIDARG
+                    var cbMap = context.MapSubresource(_drawCb, 0, MapMode.WriteDiscard, SharpDX.Direct3D11.MapFlags.None);
+                    Marshal.WriteInt32(cbMap.DataPointer, 0, BitConverter.SingleToInt32Bits(uvMinX));
+                    Marshal.WriteInt32(cbMap.DataPointer, 4, BitConverter.SingleToInt32Bits(uvMinY));
+                    Marshal.WriteInt32(cbMap.DataPointer, 8, BitConverter.SingleToInt32Bits(uvMaxX));
+                    Marshal.WriteInt32(cbMap.DataPointer, 12, BitConverter.SingleToInt32Bits(uvMaxY));
+                    context.UnmapSubresource(_drawCb, 0);
+
+                    drawStage = "CreateSRV";
+                    using var srv = new ShaderResourceView(d3dDevice, source);
+
+                    drawStage = "Bind";
+                    context.InputAssembler.PrimitiveTopology = SharpDX.Direct3D.PrimitiveTopology.TriangleList;
+                    context.VertexShader.Set(_drawVs);
+                    // VS 里也读 uvWindow（cb 寄存器），必须同样绑定，否则 uv 恒为 (0,0)、整屏变成单色
+                    context.VertexShader.SetConstantBuffer(0, _drawCb);
+                    context.PixelShader.Set(_drawPs);
+                    context.PixelShader.SetSampler(0, _drawSampler);
+                    context.PixelShader.SetConstantBuffer(0, _drawCb);
+                    context.PixelShader.SetShaderResource(0, srv);
+                    var vpW = region == null ? srcW : region.Value.Right - region.Value.Left;
+                    var vpH = region == null ? srcH : region.Value.Bottom - region.Value.Top;
+                    context.Rasterizer.SetViewport(0f, 0f, vpW, vpH);
+                    context.OutputMerger.SetTargets(_gpuTextureRtv);
+
+                    drawStage = "Draw";
+                    context.Draw(3, 0);
+                    context.PixelShader.SetShaderResource(0, null);
+                    context.OutputMerger.SetTargets((RenderTargetView)null!);
+                }
+                catch (Exception e)
+                {
+                    Debug.WriteLine($"[WGC V2][draw] 失败于 {drawStage}: {e.Message}");
+                    throw;
+                }
                 }
                 else
                 {
-                    context.CopyResource(sourceTexture, _gpuTexture);
+                    // 旧版拷贝路径（A/B 对比用）
+                    if (_region != null)
+                    {
+                        context.CopySubresourceRegion(source, 0, _region, _gpuTexture, 0);
+                    }
+                    else
+                    {
+                        context.CopyResource(source, _gpuTexture);
+                    }
                 }
-                _frameReady = true;
+
+                _gpuFrameTs = frameTs;
+                _diagFrames++;
             }
         }
         catch (SharpDXException e)
@@ -402,84 +515,86 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
 
     public GameCaptureFrame? Capture()
     {
-        if (!_frameReady) return null;
-
-        // 单飞：等价 OBS 的单视频线程；FrameArrived 只用 _lock，不受此闸门影响
+        // 单飞闸门：并发消费方逐个进入
         lock (_captureGate)
         {
-            // 阶段1（持 _lock）：状态校验、无新帧判定、从持帧表面提交拷贝到 staging（同 tick）。
-            // 临界区仅微秒级命令提交，FrameArrived 不会被本线程后续的 Map/CvtColor 阻塞
+            // 阶段1（持 _lock）：状态校验、无新到达判定、从广播纹理提交拷贝到 staging（同 tick）。
+            // 临界区仅微秒级命令提交
             SharpDX.Direct3D11.Device? d3dDevice = null;
             RECT? rect;
             long frameTs;
-            var isDuplicate = false;   // 无新帧：最新内容与上一 tick 相同
-            var cacheHit = false;      // 且缓存可用：可完全跳过 GPU 拷贝、PCIe 回读与 CvtColor
+            var isCacheHit = false;
             lock (_lock)
             {
-                if (!IsCapturing || _gpuTexture == null) return null;
+                if (!IsCapturing || _gpuTexture == null || _gpuFrameTs == 0) return null;
 
                 rect = _captureRect;
-                frameTs = _lastArrivedFrameTs;
+                frameTs = _gpuFrameTs;
 
-                isDuplicate = frameTs != 0 && frameTs == _lastConsumedFrameTs;
-                cacheHit = isDuplicate && frameTs == _cachedFrameTs && _cachedBgr != null;
-                if (!cacheHit)
+                // 无新到达（广播纹理时间戳未变）：克隆缓存——零 GPU/PCIe/CvtColor 路径
+                isCacheHit = _cachedBgr != null && _cachedFrameTs == frameTs;
+                if (!isCacheHit)
                 {
                     d3dDevice = _gpuTexture.Device;
 
-                    // _gpuTexture 在到达侧已按客户区裁剪，直接整块拷入 staging
                     EnsureStagingTextureLocked(d3dDevice, _gpuTexture.Description.Width, _gpuTexture.Description.Height);
                     var context = d3dDevice.ImmediateContext;
+                    var ts1 = Stopwatch.GetTimestamp();
                     context.CopyResource(_gpuTexture, _stagingTexture);
+                    _sumStageMs += (Stopwatch.GetTimestamp() - ts1) * 1000.0 / Stopwatch.Frequency;
                 }
 
-                // 两条路径都计为在途：Stop/Recreate 销毁 staging/_cachedBgr 前必须等其归零
+                // 两条路径都计为在途：Stop/尺寸变化销毁 staging/_cachedBgr 前必须等其归零
                 _activeCaptures++;
+
+                _diagTicks++;
+                if (isCacheHit) _diagCacheHits++;
+                if (_diagTicks % 100 == 0)
+                {
+                    Debug.WriteLine(
+                        $"[WGC V2][diag] ticks={_diagTicks} arrivals={_diagFrames} cacheHits={_diagCacheHits} recreates={_diagRecreates} " +
+                        $"avgMs: stage={_sumStageMs / 100:0.00} map={_sumMapMs / 100:0.00} cvt={_sumCvtMs / 100:0.00} clone={_sumCloneMs / 100:0.00}");
+                    _sumStageMs = _sumMapMs = _sumCvtMs = _sumCloneMs = 0;
+                }
             }
 
             Mat? target = null;
             try
             {
-                if (cacheHit)
+                if (isCacheHit)
                 {
-                    // 重复帧且缓存可用：零 GPU 拷贝、零 PCIe 回读、零 CvtColor，克隆缓存给消费者私有副本
+                    // 无新帧：克隆缓存给消费者私有副本（零 GPU 拷贝、零 PCIe 回读、零 CvtColor）
+                    var ts3 = Stopwatch.GetTimestamp();
                     target = AcquireBgrMat(_cachedBgr!.Rows, _cachedBgr.Cols);
                     _cachedBgr.CopyTo(target);
+                    _sumCloneMs += (Stopwatch.GetTimestamp() - ts3) * 1000.0 / Stopwatch.Frequency;
                 }
                 else
                 {
-                    // 阶段2（锁外）：Map 本次提交的 staging（同 tick，等待 GPU 拷贝通常亚毫秒级）
+                    // 阶段2（锁外）：Map 本次提交的 staging（同 tick，等待 GPU 拷贝通常亚毫秒级）。
+                    // 缓存常建：CvtColor 结果写入缓存，消费者拿克隆副本（后续无新帧的 tick 走零流量克隆路径）
                     var context = d3dDevice!.ImmediateContext;
                     var stagingDesc = _stagingTexture!.Description;
+                    var ts2 = Stopwatch.GetTimestamp();
                     var dataBox = context.MapSubresource(_stagingTexture, 0, MapMode.Read, SharpDX.Direct3D11.MapFlags.None);
+                    _sumMapMs += (Stopwatch.GetTimestamp() - ts2) * 1000.0 / Stopwatch.Frequency;
                     try
                     {
+                        var ts3 = Stopwatch.GetTimestamp();
                         using var bgra = Mat.FromPixelData(stagingDesc.Height, stagingDesc.Width, MatType.CV_8UC4, dataBox.DataPointer, dataBox.RowPitch);
-                        if (isDuplicate)
-                        {
-                            // 重复帧但缓存失效：本次顺带重建缓存，后续连续重复 tick 走零流量路径
-                            EnsureCache(stagingDesc.Width, stagingDesc.Height);
-                            Cv2.CvtColor(bgra, _cachedBgr!, ColorConversionCodes.BGRA2BGR);
-                            _cachedFrameTs = frameTs;
-                            target = AcquireBgrMat(stagingDesc.Height, stagingDesc.Width);
-                            _cachedBgr!.CopyTo(target);
-                        }
-                        else
-                        {
-                            // 正常新帧：直接转换进池化 Mat；
-                            // 不主动维护缓存——等真出现重复 tick 再建，持续更新场景（游戏）零额外开销
-                            target = AcquireBgrMat(stagingDesc.Height, stagingDesc.Width);
-                            Cv2.CvtColor(bgra, target, ColorConversionCodes.BGRA2BGR);
-                        }
+                        EnsureCache(stagingDesc.Width, stagingDesc.Height);
+                        Cv2.CvtColor(bgra, _cachedBgr!, ColorConversionCodes.BGRA2BGR);
+                        _cachedFrameTs = frameTs;
+                        _sumCvtMs += (Stopwatch.GetTimestamp() - ts3) * 1000.0 / Stopwatch.Frequency;
+
+                        var ts4 = Stopwatch.GetTimestamp();
+                        target = AcquireBgrMat(stagingDesc.Height, stagingDesc.Width);
+                        _cachedBgr!.CopyTo(target);
+                        _sumCloneMs += (Stopwatch.GetTimestamp() - ts4) * 1000.0 / Stopwatch.Frequency;
                     }
                     finally
                     {
                         context.UnmapSubresource(_stagingTexture, 0);
-                    }
-
-                    lock (_lock)
-                    {
-                        _lastConsumedFrameTs = frameTs;
                     }
                 }
 
@@ -503,10 +618,9 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 }
 
                 // CvtColor/CopyTo 等 OpenCvSharp 异常：池化获取的 Mat 已归还（无泄漏）；
-                // 时间戳作废，避免下一 tick 误判为重复帧而返回残缺缓存
+                // 缓存时间戳作废，避免下一 tick 误用残缺缓存
                 lock (_lock)
                 {
-                    _lastConsumedFrameTs = 0;
                     _cachedFrameTs = 0;
                 }
 
@@ -630,26 +744,11 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
         {
             IsCapturing = false;
             _hWnd = 0;
-            _frameTimer.Reset();
             if (_captureItem != null)
             {
                 _captureItem.Closed -= CaptureItemOnClosed;
             }
-            if (_captureFramePool != null)
-            {
-                _captureFramePool.FrameArrived -= OnFrameArrived;
-            }
-            if (_winEventHookMoveSize != default)
-            {
-                User32.UnhookWinEvent(_winEventHookMoveSize);
-                _winEventHookMoveSize = default;
-            }
-            if (_winEventHookLocation != default)
-            {
-                User32.UnhookWinEvent(_winEventHookLocation);
-                _winEventHookLocation = default;
-            }
-            _sizeDirty = true;
+
             _captureSession?.Dispose();
             _captureSession = null;
             _captureFramePool?.Dispose();
@@ -663,15 +762,19 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 Monitor.Wait(_lock);
             }
 
+            _gpuTextureRtv?.Dispose();
+            _gpuTextureRtv = null;
             _gpuTexture?.Dispose();
             _gpuTexture = null;
+            _drawVs?.Dispose();
+            _drawPs?.Dispose();
+            _drawSampler?.Dispose();
+            _drawCb?.Dispose();
             _stagingTexture?.Dispose();
             _stagingTexture = null;
             _cachedBgr?.Dispose();
             _cachedBgr = null;
             _cachedFrameTs = 0;
-            _lastConsumedFrameTs = 0;
-            _lastArrivedFrameTs = 0;
             while (_bgrQueue.TryDequeue(out var pooled)) pooled.Dispose();
             _bgrPoolClosed = true;
             _hdrOutputTexture?.Dispose();
@@ -682,7 +785,6 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
             _hdrComputeShader = null;
             _d3dDevice?.Dispose();
             _d3dDevice = null;
-            _frameReady = false;
         }
     }
 
@@ -691,15 +793,60 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
         Stop();
     }
 
-    private void WinEventProc(User32.HWINEVENTHOOK hWinEventHook, uint @event, HWND hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
+    /// <summary>
+    /// FFmpeg gfxcapture 同款：把 WGC 推帧率限到消费需求率（26100+，IGraphicsCaptureSession5）。
+    /// C# 投影（TFM 22621）不含该接口，走 QI + vtable 直调；不可用/失败仅告警降级，不影响捕获。
+    /// </summary>
+    private void TryApplyMinUpdateInterval(GraphicsCaptureSession session)
     {
-        if (idObject != 0) return;
-        if (hwnd != default && hwnd.DangerousGetHandle() == _hWnd)
+        if (!ApiInformation.IsPropertyPresent("Windows.Graphics.Capture.GraphicsCaptureSession", "MinUpdateInterval"))
         {
-            _sizeDirty = true;
+            Debug.WriteLine("[WGC V2] MinUpdateInterval 不可用，跳过限流（取帧逻辑不依赖它）");
+            return;
+        }
+
+        try
+        {
+            // IGraphicsCaptureSession5 {67C0EA62-1F85-5061-925A-239BE0AC09CB}
+            var iid = GraphicsCaptureSession5Iid;
+            var unknown = Marshal.GetIUnknownForObject(session);
+            try
+            {
+                if (Marshal.QueryInterface(unknown, ref iid, out var session5) != 0)
+                {
+                    Debug.WriteLine("[WGC V2] QueryInterface IGraphicsCaptureSession5 失败，跳过限流");
+                    return;
+                }
+
+                try
+                {
+                    // vtable 布局：IUnknown 0-2 + IInspectable 3-5 + get_MinUpdateInterval 6 + put_MinUpdateInterval 7
+                    var vtbl = Marshal.ReadIntPtr(session5);
+                    var putPtr = Marshal.ReadIntPtr(vtbl, PutMinUpdateIntervalVtableSlot * IntPtr.Size);
+                    var put = Marshal.GetDelegateForFunctionPointer<PutMinUpdateIntervalDelegate>(putPtr);
+                    var hr = put(session5, _minUpdateIntervalHns);
+                    if (hr < 0)
+                    {
+                        Debug.WriteLine($"[WGC V2] put_MinUpdateInterval 失败: 0x{hr:X8}");
+                    }
+                    else
+                    {
+                        Debug.WriteLine($"[WGC V2] MinUpdateInterval 已设置: {_minUpdateIntervalHns / 10000.0:0.##}ms");
+                    }
+                }
+                finally
+                {
+                    Marshal.Release(session5);
+                }
+            }
+            finally
+            {
+                Marshal.Release(unknown);
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.WriteLine($"[WGC V2] 应用 MinUpdateInterval 异常: {e.Message}");
         }
     }
-
-    private const int SizeFallbackCheckMs = 3000;
-    private long _lastSizeFallbackCheckMs;
 }

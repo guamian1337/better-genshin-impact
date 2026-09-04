@@ -150,7 +150,9 @@ namespace BetterGenshinImpact.GameTask
             GameCapture.Start(hWnd,
                 new Dictionary<string, object>()
                 {
-                    { "autoFixWin11BitBlt", OsVersionHelper.IsWindows11_OrGreater && TaskContext.Instance().Config.AutoFixWin11BitBlt }
+                    { "autoFixWin11BitBlt", OsVersionHelper.IsWindows11_OrGreater && TaskContext.Instance().Config.AutoFixWin11BitBlt },
+                    // WGC 限流：DWM 推帧率对齐识别节拍（MinUpdateInterval = 1/interval），避免 DWM 高频拷帧后被丢弃
+                    { "MinUpdateIntervalMs", interval }
                 }
             );
 
