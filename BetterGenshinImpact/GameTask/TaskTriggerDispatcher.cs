@@ -147,12 +147,16 @@ namespace BetterGenshinImpact.GameTask
             // }
 
             // 启动截图
+            // WGC 限流：独立设置优先；未设置(0)则跟随识别节拍
+            var wgcMinUpdateIntervalMs = TaskContext.Instance().Config.WgcMinUpdateIntervalMs > 0
+                ? TaskContext.Instance().Config.WgcMinUpdateIntervalMs
+                : interval;
             GameCapture.Start(hWnd,
                 new Dictionary<string, object>()
                 {
                     { "autoFixWin11BitBlt", OsVersionHelper.IsWindows11_OrGreater && TaskContext.Instance().Config.AutoFixWin11BitBlt },
                     // WGC 限流：DWM 推帧率对齐识别节拍（MinUpdateInterval = 1/interval），避免 DWM 高频拷帧后被丢弃
-                    { "MinUpdateIntervalMs", interval }
+                    { "MinUpdateIntervalMs", wgcMinUpdateIntervalMs }
                 }
             );
 

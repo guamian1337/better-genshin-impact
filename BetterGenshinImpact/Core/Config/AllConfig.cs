@@ -60,6 +60,13 @@ public partial class AllConfig : ObservableObject
     [ObservableProperty]
     private int _triggerInterval = 50;
 
+    /// <summary>
+    ///     WGC V2 帧率上限（毫秒，即最小更新间隔，限制 DWM 推帧频率）
+    ///     0 = 跟随触发器触发频率；仅 Windows 11 24H2 及以上系统生效
+    /// </summary>
+    [ObservableProperty]
+    private int _wgcMinUpdateIntervalMs;
+
     // /// <summary>
     // ///     WGC使用位图缓存
     // ///     高帧率情况下，可能会导致卡顿
