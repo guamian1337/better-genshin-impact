@@ -43,16 +43,28 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
 
     private readonly object _lock = new();
 
-    // 单 GPU 广播源（参考 bgi-wgc-single-slot / _gpuFrameTexture 模式）
-    // 回调只做 GPU->GPU Copy 到此纹理，消费侧 Capture() 再从它 Copy 到 staging 读回
+    // 单 GPU 广播源：FrameArrived 每帧一次 GPU->GPU 拷贝（latest-wins），消费侧 Capture() 从它 stage 读回
     private Texture2D? _gpuTexture;
     private volatile bool _frameReady;
 
-    // staging 双缓冲：交替使用两块 staging，避免 GPU 写与 CPU Map 连续命中同一块表面；
-    // Stage 与 Map 均针对本次的 cur（不读旧帧）
-    private const int StagingCount = 2;
-    private readonly Texture2D?[] _stagingTextures = new Texture2D?[2];
-    private int _stagingIndex;
+    // 单一 staging：消费时从 _gpuTexture 提交 GPU 拷贝并同 tick 阻塞 Map（等待通常亚毫秒级，无流水滞后）。
+    // 消费被 _captureGate 串行化，单块 staging 即安全
+    private Texture2D? _stagingTexture;
+
+    // 单飞闸门：并发消费方逐个进入；FrameArrived 只用 _lock，不受此闸门影响
+    private readonly object _captureGate = new();
+
+    // 在途捕获数（正持锁外 Map/CvtColor）。Stop 与尺寸 Recreate 销毁 staging 前必须等其归零；仅锁内访问
+    private int _activeCaptures;
+
+    // 无新帧跳过读回：识别节拍与帧到达率解耦——窗口静止时 FrameArrived 不触发，但识别 tick 仍在跑，
+    // 若无缓存，每个 tick 都会对同一块旧纹理重复 stage 拷贝 + Map 回读 + CvtColor（三重空转）。
+    // 策略：仅在真的出现重复 tick 时才建/用缓存，持续更新的场景（游戏）零额外开销。
+    // 三个时间戳/缓存仅在 _captureGate（单飞）内写；读侧 _lastArrivedFrameTs 在 _lock 内写
+    private Mat? _cachedBgr;
+    private long _lastArrivedFrameTs;    // 最近到达帧的 SystemRelativeTime（_lock 内写）
+    private long _lastConsumedFrameTs;   // 最近一次成功消费帧的时间戳
+    private long _cachedFrameTs;         // 缓存内容对应的帧时间戳
 
     // Surface 大小
     private int _surfaceWidth;
@@ -272,13 +284,13 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
         }
     }
 
-    private void EnsureStagingTextureLocked(SharpDX.Direct3D11.Device device, int index, int width, int height)
+    private void EnsureStagingTextureLocked(SharpDX.Direct3D11.Device device, int width, int height)
     {
-        var tex = _stagingTextures[index];
-        if (tex == null || tex.Description.Width != width || tex.Description.Height != height)
+        if (_stagingTexture == null || _stagingTexture.Description.Width != width ||
+            _stagingTexture.Description.Height != height)
         {
-            tex?.Dispose();
-            _stagingTextures[index] = Direct3D11Helper.CreateStagingTexture(device, width, height, null);
+            _stagingTexture?.Dispose();
+            _stagingTexture = Direct3D11Helper.CreateStagingTexture(device, width, height, null);
         }
     }
 
@@ -308,6 +320,8 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                 using var frame = sender.TryGetNextFrame();
                 if (frame == null) return;
 
+                _lastArrivedFrameTs = frame.SystemRelativeTime.Ticks;
+
                 // 尺寸脏标志清零与 fallback 节流统一在锁内；
                 // 置位方 WinEventProc(UI hook 线程) 为锁外原子写 true
                 if (_sizeDirty || now - _lastSizeFallbackCheckMs >= SizeFallbackCheckMs)
@@ -327,15 +341,24 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                         var newW = _region != null ? _region.Value.Right - _region.Value.Left : captureSize.Width;
                         var newH = _region != null ? _region.Value.Bottom - _region.Value.Top : captureSize.Height;
                         TrimBgrPoolForSizeLocked(newH, newW);
+
+                        // 先挡住新的 Capture()，再等在途捕获退出（其可能正在锁外 Map staging/读缓存），
+                        // 之后才允许销毁资源，否则会踩到已释放纹理
+                        _frameReady = false;
+                        while (_activeCaptures > 0)
+                        {
+                            Monitor.Wait(_lock);
+                        }
+
                         _gpuTexture?.Dispose();
                         _gpuTexture = null;
-                        for (var i = 0; i < StagingCount; i++)
-                        {
-                            _stagingTextures[i]?.Dispose();
-                            _stagingTextures[i] = null;
-                        }
-                        _stagingIndex = 0;
-                        _frameReady = false;
+                        _stagingTexture?.Dispose();
+                        _stagingTexture = null;
+                        _cachedBgr?.Dispose();
+                        _cachedBgr = null;
+                        _cachedFrameTs = 0;
+                        _lastConsumedFrameTs = 0;
+                        _lastArrivedFrameTs = 0;
                         _hdrOutputTexture?.Dispose();
                         _hdrOutputTexture = null;
                         _hdrOutputUav?.Dispose();
@@ -350,6 +373,7 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
                     }
                 }
 
+                // 每帧一次 GPU->GPU 拷贝（latest-wins），消费侧 Capture() 从 _gpuTexture stage 读回
                 using var surfaceTexture = Direct3D11Helper.CreateSharpDXTexture2D(frame.Surface);
                 var sourceTexture = _isHdrEnabled ? ProcessHdrTexture(surfaceTexture) : surfaceTexture;
                 var d3dDevice = sourceTexture.Device;
@@ -380,49 +404,132 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
     {
         if (!_frameReady) return null;
 
-        lock (_lock)
+        // 单飞：等价 OBS 的单视频线程；FrameArrived 只用 _lock，不受此闸门影响
+        lock (_captureGate)
         {
-            if (_gpuTexture == null) return null;
+            // 阶段1（持 _lock）：状态校验、无新帧判定、从持帧表面提交拷贝到 staging（同 tick）。
+            // 临界区仅微秒级命令提交，FrameArrived 不会被本线程后续的 Map/CvtColor 阻塞
+            SharpDX.Direct3D11.Device? d3dDevice = null;
+            RECT? rect;
+            long frameTs;
+            var isDuplicate = false;   // 无新帧：最新内容与上一 tick 相同
+            var cacheHit = false;      // 且缓存可用：可完全跳过 GPU 拷贝、PCIe 回读与 CvtColor
+            lock (_lock)
+            {
+                if (!IsCapturing || _gpuTexture == null) return null;
 
+                rect = _captureRect;
+                frameTs = _lastArrivedFrameTs;
+
+                isDuplicate = frameTs != 0 && frameTs == _lastConsumedFrameTs;
+                cacheHit = isDuplicate && frameTs == _cachedFrameTs && _cachedBgr != null;
+                if (!cacheHit)
+                {
+                    d3dDevice = _gpuTexture.Device;
+
+                    // _gpuTexture 在到达侧已按客户区裁剪，直接整块拷入 staging
+                    EnsureStagingTextureLocked(d3dDevice, _gpuTexture.Description.Width, _gpuTexture.Description.Height);
+                    var context = d3dDevice.ImmediateContext;
+                    context.CopyResource(_gpuTexture, _stagingTexture);
+                }
+
+                // 两条路径都计为在途：Stop/Recreate 销毁 staging/_cachedBgr 前必须等其归零
+                _activeCaptures++;
+            }
+
+            Mat? target = null;
             try
             {
-                var d3dDevice = _gpuTexture.Device;
-                var desc = _gpuTexture.Description;
-                var rect = _captureRect;
+                if (cacheHit)
+                {
+                    // 重复帧且缓存可用：零 GPU 拷贝、零 PCIe 回读、零 CvtColor，克隆缓存给消费者私有副本
+                    target = AcquireBgrMat(_cachedBgr!.Rows, _cachedBgr.Cols);
+                    _cachedBgr.CopyTo(target);
+                }
+                else
+                {
+                    // 阶段2（锁外）：Map 本次提交的 staging（同 tick，等待 GPU 拷贝通常亚毫秒级）
+                    var context = d3dDevice!.ImmediateContext;
+                    var stagingDesc = _stagingTexture!.Description;
+                    var dataBox = context.MapSubresource(_stagingTexture, 0, MapMode.Read, SharpDX.Direct3D11.MapFlags.None);
+                    try
+                    {
+                        using var bgra = Mat.FromPixelData(stagingDesc.Height, stagingDesc.Width, MatType.CV_8UC4, dataBox.DataPointer, dataBox.RowPitch);
+                        if (isDuplicate)
+                        {
+                            // 重复帧但缓存失效：本次顺带重建缓存，后续连续重复 tick 走零流量路径
+                            EnsureCache(stagingDesc.Width, stagingDesc.Height);
+                            Cv2.CvtColor(bgra, _cachedBgr!, ColorConversionCodes.BGRA2BGR);
+                            _cachedFrameTs = frameTs;
+                            target = AcquireBgrMat(stagingDesc.Height, stagingDesc.Width);
+                            _cachedBgr!.CopyTo(target);
+                        }
+                        else
+                        {
+                            // 正常新帧：直接转换进池化 Mat；
+                            // 不主动维护缓存——等真出现重复 tick 再建，持续更新场景（游戏）零额外开销
+                            target = AcquireBgrMat(stagingDesc.Height, stagingDesc.Width);
+                            Cv2.CvtColor(bgra, target, ColorConversionCodes.BGRA2BGR);
+                        }
+                    }
+                    finally
+                    {
+                        context.UnmapSubresource(_stagingTexture, 0);
+                    }
 
-                var stagingWidth = desc.Width;
-                var stagingHeight = desc.Height;
+                    lock (_lock)
+                    {
+                        _lastConsumedFrameTs = frameTs;
+                    }
+                }
 
-                var curIdx = _stagingIndex;
-
-                EnsureStagingTextureLocked(d3dDevice, curIdx, stagingWidth, stagingHeight);
-
-                var stagingCur = _stagingTextures[curIdx]!;
-                var context = d3dDevice.ImmediateContext;
-                // Stage 写 cur（GPU -> staging cur）
-                context.CopyResource(_gpuTexture, stagingCur);
-
-                // 直接 Map cur：等待本次 Copy 完成（阻塞极短）。
-                // 不再读 prev 流水缓冲——那会让识别内容固定滞后 1 个 Tick(~50ms)，体感延迟明显
-                var mat = stagingCur.CreateMat(d3dDevice, AcquireBgrMat, ReleaseBgrMat);
-
-                // 翻转 cur/prev 供下一帧流水
-                _stagingIndex ^= 1;
-
-                return mat == null ? null : new GameCaptureFrame(mat, rect);
+                return new GameCaptureFrame(WgcBgrMat.CreateFrom(target, ReleaseBgrMat), rect);
             }
             catch (SharpDXException e)
             {
+                if (target != null)
+                {
+                    ReleaseBgrMat(target);
+                }
+
                 HandleSharpDxError(e);
                 return null;
             }
             catch (Exception e)
             {
-                // CvtColor 等 OpenCvSharp 异常：池化 CreateMat 已在异常路径归还借出 Mat（无泄漏），
-                // 此处兜底返回 null 与原版 CreateMat 语义一致，避免异常穿透到任务引擎
+                if (target != null)
+                {
+                    ReleaseBgrMat(target);
+                }
+
+                // CvtColor/CopyTo 等 OpenCvSharp 异常：池化获取的 Mat 已归还（无泄漏）；
+                // 时间戳作废，避免下一 tick 误判为重复帧而返回残缺缓存
+                lock (_lock)
+                {
+                    _lastConsumedFrameTs = 0;
+                    _cachedFrameTs = 0;
+                }
+
                 Debug.WriteLine($"[WGC V2] Capture 异常: {e.Message}");
                 return null;
             }
+            finally
+            {
+                lock (_lock)
+                {
+                    _activeCaptures--;
+                    Monitor.PulseAll(_lock);
+                }
+            }
+        }
+    }
+
+    private void EnsureCache(int width, int height)
+    {
+        if (_cachedBgr == null || _cachedBgr.Cols != width || _cachedBgr.Rows != height)
+        {
+            _cachedBgr?.Dispose();
+            _cachedBgr = new Mat(height, width, MatType.CV_8UC3);
         }
     }
 
@@ -548,14 +655,23 @@ public class GraphicsCaptureV2(bool captureHdr = false) : IGameCapture
             _captureFramePool?.Dispose();
             _captureFramePool = null;
             _captureItem = null;
+
+            // IsCapturing=false 已挡住新的 Capture()；等待在途捕获（正锁外 Map/CvtColor）退出，
+            // 才能销毁其正在使用的 staging/纹理/设备。Monitor.Wait 原子放锁，捕获 finally 归零时唤醒
+            while (_activeCaptures > 0)
+            {
+                Monitor.Wait(_lock);
+            }
+
             _gpuTexture?.Dispose();
             _gpuTexture = null;
-            for (var i = 0; i < StagingCount; i++)
-            {
-                _stagingTextures[i]?.Dispose();
-                _stagingTextures[i] = null;
-            }
-            _stagingIndex = 0;
+            _stagingTexture?.Dispose();
+            _stagingTexture = null;
+            _cachedBgr?.Dispose();
+            _cachedBgr = null;
+            _cachedFrameTs = 0;
+            _lastConsumedFrameTs = 0;
+            _lastArrivedFrameTs = 0;
             while (_bgrQueue.TryDequeue(out var pooled)) pooled.Dispose();
             _bgrPoolClosed = true;
             _hdrOutputTexture?.Dispose();
